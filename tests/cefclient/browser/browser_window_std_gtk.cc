@@ -6,8 +6,11 @@
 
 #include <X11/Xlib.h>
 #include <gdk/gdk.h>
+#include <gdk/gdkwayland.h>
 #include <gdk/gdkx.h>
 #include <gtk/gtk.h>
+
+#include <cstdlib>
 #undef Success     // Definition conflicts with cef_message_router.h
 #undef RootWindow  // Definition conflicts with root_window.h
 
@@ -94,6 +97,31 @@ void BrowserWindowStdGtk::set_xdisplay(XDisplay* xdisplay) {
   xdisplay_ = xdisplay;
 }
 
+void BrowserWindowStdGtk::OnBrowserCreated(CefRefPtr<CefBrowser> browser) {
+  REQUIRE_MAIN_THREAD();
+
+  // Wayland embedding (#2804): the browser renders into a wl_subsurface of
+  // |wayland_parent_|'s wl_surface. The subsurface's initial addition and
+  // position are double-buffered against that parent surface and only take
+  // effect when the parent surface is committed. libcef intentionally does NOT
+  // commit the embedder-owned parent surface (that would race/clobber GTK's own
+  // surface state), so trigger the commit here by invalidating the parent GDK
+  // window: GTK then repaints and commits it, latching the subsurface. This
+  // mirrors Firefox's MozContainerWayland approach.
+  if (wayland_parent_) {
+    ScopedGdkThreadsEnter scoped_gdk_threads;
+    if (GdkWindow* window = gtk_widget_get_window(wayland_parent_)) {
+      gdk_window_invalidate_rect(window, nullptr, TRUE);
+    }
+  }
+
+  // Notify the RootWindow only after the parent commit has been requested. A
+  // close may have arrived while browser creation was pending, in which case
+  // the delegate immediately starts teardown and this object may subsequently
+  // be deleted.
+  BrowserWindow::OnBrowserCreated(browser);
+}
+
 void BrowserWindowStdGtk::CreateBrowser(
     ClientWindowHandle parent_handle,
     const CefRect& rect,
@@ -103,7 +131,23 @@ void BrowserWindowStdGtk::CreateBrowser(
   REQUIRE_MAIN_THREAD();
 
   CefWindowInfo window_info;
-  window_info.SetAsChild(GetXWindowForWidget(parent_handle), rect);
+#if CEF_API_ADDED(CEF_EXPERIMENTAL)
+  if (GDK_IS_WAYLAND_DISPLAY(gtk_widget_get_display(parent_handle))) {
+    // Wayland embedding: parent the browser to the GTK window's wl_surface as
+    // a wl_subsurface. The widget must be realized.
+    ScopedGdkThreadsEnter scoped_gdk_threads;
+    wl_surface* surface =
+        gdk_wayland_window_get_wl_surface(gtk_widget_get_window(parent_handle));
+    CHECK(surface);
+    window_info.SetAsWaylandChild(surface, rect);
+    // Remember the parent widget so OnBrowserCreated() can commit its surface
+    // and latch the browser's wl_subsurface. See CEF issue #2804.
+    wayland_parent_ = parent_handle;
+  } else
+#endif
+  {
+    window_info.SetAsChild(GetXWindowForWidget(parent_handle), rect);
+  }
 
   if (delegate_->UseAlloyStyle()) {
     window_info.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
@@ -137,7 +181,8 @@ void BrowserWindowStdGtk::ShowPopup(ClientWindowHandle parent_handle,
                                     size_t height) {
   REQUIRE_MAIN_THREAD();
 
-  if (browser_) {
+  // X11 reparenting is not applicable to Wayland subsurface embedding.
+  if (browser_ && xdisplay_) {
     ::Window parent_xwindow = GetXWindowForWidget(parent_handle);
     CHECK(xdisplay_ != 0);
     ::Window xwindow = browser_->GetHost()->GetWindowHandle();
@@ -153,7 +198,9 @@ void BrowserWindowStdGtk::ShowPopup(ClientWindowHandle parent_handle,
 void BrowserWindowStdGtk::Show() {
   REQUIRE_MAIN_THREAD();
 
-  if (browser_) {
+  // On Wayland (no |xdisplay_|) the browser is a wl_subsurface already shown by
+  // the library; skip the X11 visibility manipulation (CEF issue #2804).
+  if (browser_ && xdisplay_) {
     ::Window xwindow = browser_->GetHost()->GetWindowHandle();
     DCHECK(xwindow);
     SetXWindowVisible(xdisplay_, xwindow, true);
@@ -163,7 +210,7 @@ void BrowserWindowStdGtk::Show() {
 void BrowserWindowStdGtk::Hide() {
   REQUIRE_MAIN_THREAD();
 
-  if (browser_) {
+  if (browser_ && xdisplay_) {
     ::Window xwindow = browser_->GetHost()->GetWindowHandle();
     DCHECK(xwindow);
     SetXWindowVisible(xdisplay_, xwindow, false);
@@ -172,8 +219,23 @@ void BrowserWindowStdGtk::Hide() {
 
 void BrowserWindowStdGtk::SetBounds(int x, int y, size_t width, size_t height) {
   REQUIRE_MAIN_THREAD();
+  if (!browser_) {
+    return;
+  }
 
-  if (xdisplay_ && browser_) {
+#if CEF_API_ADDED(CEF_EXPERIMENTAL)
+  // Wayland embedding and X11 Alloy browsers use the unified host API. Keep
+  // Chrome-style X11 on its existing native path: SetBounds() intentionally
+  // rejects Chrome-style browsers, and --wayland-embed must not regress normal
+  // native cefclient resizing.
+  if (!xdisplay_ || delegate_->UseAlloyStyle()) {
+    browser_->GetHost()->SetBounds(
+        CefRect(x, y, static_cast<int>(width), static_cast<int>(height)));
+    return;
+  }
+#endif
+
+  if (xdisplay_) {
     ::Window xwindow = browser_->GetHost()->GetWindowHandle();
     DCHECK(xwindow);
     SetXWindowBounds(xdisplay_, xwindow, x, y, width, height);

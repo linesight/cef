@@ -330,6 +330,8 @@ void CefBrowserPlatformDelegate::SendCaptureLostEvent() {
 #if BUILDFLAG(IS_WIN) || (BUILDFLAG(IS_POSIX) && !BUILDFLAG(IS_MAC))
 void CefBrowserPlatformDelegate::NotifyMoveOrResizeStarted() {}
 
+void CefBrowserPlatformDelegate::SetBounds(const gfx::Rect& bounds) {}
+
 void CefBrowserPlatformDelegate::SizeTo(int width, int height) {}
 #endif
 

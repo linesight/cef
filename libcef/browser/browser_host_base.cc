@@ -990,6 +990,34 @@ void CefBrowserHostBase::SetAxViewportCollapse(bool enabled) {
   }
 }
 
+void CefBrowserHostBase::SetBounds(const CefRect& bounds) {
+  if (!CEF_CURRENTLY_ON_UIT()) {
+    CEF_POST_TASK(CEF_UIT, base::BindOnce(&CefBrowserHostBase::SetBounds, this,
+                                          CefRect(bounds)));
+    return;
+  }
+
+  if (bounds.width <= 0 || bounds.height <= 0) {
+    LOG(WARNING) << "CefBrowserHost::SetBounds requires positive dimensions";
+    return;
+  }
+
+#if BUILDFLAG(IS_WIN) || (BUILDFLAG(IS_POSIX) && !BUILDFLAG(IS_MAC))
+  if (IsWindowless() || is_views_hosted_ || !IsAlloyStyle()) {
+    LOG(WARNING) << "CefBrowserHost::SetBounds is only supported for windowed "
+                    "Alloy-style browsers with an external parent";
+    return;
+  }
+
+  if (platform_delegate_) {
+    platform_delegate_->SetBounds(
+        gfx::Rect(bounds.x, bounds.y, bounds.width, bounds.height));
+  }
+#else
+  LOG(WARNING) << "CefBrowserHost::SetBounds is not supported on this platform";
+#endif
+}
+
 void CefBrowserHostBase::ReplaceMisspelling(const CefString& word) {
   if (!CEF_CURRENTLY_ON_UIT()) {
     CEF_POST_TASK(

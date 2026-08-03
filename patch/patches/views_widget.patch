@@ -294,7 +294,7 @@ index 077855979045d4862abd099ec16befa0fcecff65..69f369b06c29e65dead98a52cc8b743e
    return host ? host->GetAcceleratedWidget() : nullptr;
  }
 diff --git ui/views/widget/desktop_aura/desktop_window_tree_host_linux.cc ui/views/widget/desktop_aura/desktop_window_tree_host_linux.cc
-index 9636206c48ae85b621026256741e389b35fe2719..17b8ded39cb08e6ccc58b29c12d5ba5333b40502 100644
+index 9636206c48ae85b621026256741e389b35fe2719..29a26c12162ea92d5f0802d9e42b717669b68ee2 100644
 --- ui/views/widget/desktop_aura/desktop_window_tree_host_linux.cc
 +++ ui/views/widget/desktop_aura/desktop_window_tree_host_linux.cc
 @@ -30,6 +30,7 @@
@@ -324,7 +324,7 @@ index 9636206c48ae85b621026256741e389b35fe2719..17b8ded39cb08e6ccc58b29c12d5ba53
  void DesktopWindowTreeHostLinux::DispatchEvent(ui::Event* event) {
    // In Windows, the native events sent to chrome are separated into client
    // and non-client versions of events, which we record on our LocatedEvent
-@@ -490,6 +503,15 @@ void DesktopWindowTreeHostLinux::AddAdditionalInitProperties(
+@@ -490,6 +503,20 @@ void DesktopWindowTreeHostLinux::AddAdditionalInitProperties(
  
    properties->wayland_app_id = params.wayland_app_id;
  
@@ -333,6 +333,11 @@ index 9636206c48ae85b621026256741e389b35fe2719..17b8ded39cb08e6ccc58b29c12d5ba53
 +    if (!properties->parent_widget) {
 +      properties->parent_widget = params.parent_widget;
 +    }
++    // CEF issue #2804: forward the external Wayland parent surface so the
++    // window can root itself as a wl_subsurface of the embedder's surface, plus
++    // the subsurface's offset within that surface (the host's content area).
++    properties->parent_wayland_surface = params.parent_wayland_surface;
++    properties->wayland_subsurface_offset = params.wayland_subsurface_offset;
 +  } else {
 +    properties->parent_widget = params.parent_widget;
 +  }
@@ -661,16 +666,30 @@ diff --git ui/views/widget/widget.h ui/views/widget/widget.h
 index 1f896e094c4da08706ef016577565eb112fdbb9d..af19aef3c8737a9a540f3dd7df6463c0316c51c3 100644
 --- ui/views/widget/widget.h
 +++ ui/views/widget/widget.h
-@@ -441,6 +441,8 @@ class VIEWS_EXPORT Widget : public internal::NativeWidgetDelegate,
+@@ -441,6 +441,22 @@ class VIEWS_EXPORT Widget : public internal::NativeWidgetDelegate,
      // setters above.
      gfx::NativeView parent = gfx::NativeView();
  
 +    gfx::AcceleratedWidget parent_widget = gfx::kNullAcceleratedWidget;
 +
++    // CEF: external Wayland parent surface (wl_surface*) to embed this widget
++    // into as a wl_subsurface on the Ozone/Wayland backend. Parallel to
++    // |parent_widget| (used on X11). Opaque (void*) here to avoid a
++    // wayland-client dependency in this widely-included header.
++    void* parent_wayland_surface = nullptr;
++
++    // CEF: offset (in DIP) of the embedded wl_subsurface within
++    // |parent_wayland_surface|, i.e. where the browser sits inside the host's
++    // content area. Kept separate from |bounds| (which stays zero-origin):
++    // giving the widget a non-zero origin marks it off the root window and
++    // occlusion tracking hides the WebContents, stopping frame production.
++    // Only used on the Ozone/Wayland embedding path. See CEF issue #2804.
++    gfx::Point wayland_subsurface_offset;
++
      // Specifies the initial bounds of the Widget. Default is empty, which means
      // the NativeWidget may specify a default size. If the parent is specified
      // and the widget type is not WINDOW_TYPE_POPUP, `bounds` is in the parent's
-@@ -951,7 +953,7 @@ class VIEWS_EXPORT Widget : public internal::NativeWidgetDelegate,
+@@ -951,7 +967,7 @@ class VIEWS_EXPORT Widget : public internal::NativeWidgetDelegate,
    void SetVisible(bool visible);
  
    // Activates the widget, assuming it already exists and is visible.

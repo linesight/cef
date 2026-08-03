@@ -249,6 +249,10 @@ class CefBrowserPlatformDelegate {
   // on Windows and Linux.
   virtual void NotifyMoveOrResizeStarted();
 
+  // Set the externally parented native child window bounds. Only used with
+  // windowed rendering on Windows and Linux.
+  virtual void SetBounds(const gfx::Rect& bounds);
+
   // Resize the host window to the given dimensions. Only used with windowed
   // rendering on Windows and Linux.
   virtual void SizeTo(int width, int height);

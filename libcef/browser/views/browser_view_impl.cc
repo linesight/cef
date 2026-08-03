@@ -399,8 +399,8 @@ void CefBrowserViewImpl::SetPendingBrowserCreateParams(
     CefRefPtr<CefRequestContext> request_context) {
   DCHECK(!pending_browser_create_params_);
   pending_browser_create_params_ = std::make_unique<CefBrowserCreateParams>();
-  pending_browser_create_params_->MaybeSetWindowInfo(
-      window_info, /*allow_alloy_style=*/true, /*allow_chrome_style=*/true);
+  CHECK(pending_browser_create_params_->MaybeSetWindowInfo(
+      window_info, /*allow_alloy_style=*/true, /*allow_chrome_style=*/true));
   pending_browser_create_params_->client = client;
   pending_browser_create_params_->url = url;
   pending_browser_create_params_->settings = settings;

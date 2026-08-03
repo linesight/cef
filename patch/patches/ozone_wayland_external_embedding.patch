@@ -1,0 +1,1455 @@
+diff --git ui/events/platform/wayland/wayland_event_watcher.cc ui/events/platform/wayland/wayland_event_watcher.cc
+index 0e9467924d4a31f99356e9127b9fcce8a33b6dde..8d3ef3b79e0885afceb258e04094bb48f3e573f1 100644
+--- ui/events/platform/wayland/wayland_event_watcher.cc
++++ ui/events/platform/wayland/wayland_event_watcher.cc
+@@ -6,8 +6,12 @@
+ 
+ #include <wayland-client-core.h>
+ 
++#include <poll.h>
++
+ #include <cstring>
+ 
++#include "base/posix/eintr_wrapper.h"
++
+ #include "base/check.h"
+ #include "base/environment.h"
+ #include "base/logging.h"
+@@ -133,10 +137,12 @@ class WaylandEventWatcherThread : public base::Thread {
+ 
+ WaylandEventWatcher::WaylandEventWatcher(wl_display* display,
+                                          wl_event_queue* event_queue,
+-                                         bool use_threaded_polling)
++                                         bool use_threaded_polling,
++                                         bool cooperative_dispatch)
+     : display_(display),
+       event_queue_(event_queue),
+-      use_threaded_polling_(use_threaded_polling) {
++      use_threaded_polling_(use_threaded_polling),
++      cooperative_dispatch_(cooperative_dispatch) {
+   DCHECK(display_);
+ }
+ 
+@@ -207,6 +213,14 @@ void WaylandEventWatcher::StartProcessingEventsThread() {
+ }
+ 
+ void WaylandEventWatcher::RoundTripQueue() {
++  // On a shared wl_display (CEF #2804) the external owner (e.g. GDK) may also
++  // read the connection fd. A blocking wl_display_roundtrip_queue races that
++  // reader and can hang. Pump cooperatively instead.
++  if (cooperative_dispatch_) {
++    RoundTripQueueCooperative();
++    return;
++  }
++
+   // NOTE: When we are using dedicated polling thread, RoundTripQueue
+   // expected to be called by different thread from dedicated polling
+   // thread so here we can call wl_display_roundtrip_queue directly
+@@ -225,6 +239,36 @@ void WaylandEventWatcher::RoundTripQueue() {
+   wl_display_roundtrip_queue(display_, event_queue_);
+ }
+ 
++void WaylandEventWatcher::RoundTripQueueCooperative() {
++  DCHECK_CALLED_ON_VALID_THREAD(thread_checker_);
++
++  // Dispatch anything already queued on our event queue first (it may have been
++  // read off the fd by the external owner's reader, e.g. GDK).
++  if (!WlDisplayPrepareToRead()) {
++    // prepare_read reported pending events; dispatch them without touching the
++    // fd (which the other reader may be managing).
++    WlDisplayDispatchPendingQueue();
++    return;
++  }
++
++  // We successfully prepared to read: for this cycle we are a registered reader
++  // (coordinated with any other readers via libwayland's reader count). Wait
++  // briefly for fd activity, then read + dispatch. The timeout guarantees we
++  // always return so the caller's loop can re-check its condition and we never
++  // block indefinitely on a connection another party may be draining.
++  Flush();
++  pollfd pfd = {wl_display_get_fd(display_), POLLIN, 0};
++  const int ret = HANDLE_EINTR(poll(&pfd, 1, /*timeout_ms=*/8));
++  if (ret > 0 && (pfd.revents & POLLIN)) {
++    WlDisplayReadEvents();
++  } else {
++    // Timed out or error: back out of the read so we don't leave the connection
++    // in the prepared-to-read state.
++    WlDisplayCancelRead();
++  }
++  WlDisplayDispatchPendingQueue();
++}
++
+ void WaylandEventWatcher::StopProcessingEvents() {
+   if (!watching_) {
+     return;
+diff --git ui/events/platform/wayland/wayland_event_watcher.h ui/events/platform/wayland/wayland_event_watcher.h
+index 63b55f5ebed5da07d11b8b16faa0b1efe7d6cbbf..8feb729c95460364028f87a7be88af664c2bc562 100644
+--- ui/events/platform/wayland/wayland_event_watcher.h
++++ ui/events/platform/wayland/wayland_event_watcher.h
+@@ -42,7 +42,8 @@ class WaylandEventWatcher {
+   static std::unique_ptr<WaylandEventWatcher> CreateWaylandEventWatcher(
+       wl_display* display,
+       wl_event_queue* event_queue,
+-      bool use_threaded_polling = false);
++      bool use_threaded_polling = false,
++      bool cooperative_dispatch = false);
+ 
+   // Sets a callback that that shutdowns the browser in case of
+   // unrecoverable error. Can only be set once.
+@@ -66,7 +67,8 @@ class WaylandEventWatcher {
+  protected:
+   WaylandEventWatcher(wl_display* display,
+                       wl_event_queue* event_queue,
+-                      bool use_threaded_polling);
++                      bool use_threaded_polling,
++                      bool cooperative_dispatch);
+ 
+   // Starts watching the fd. Returns true on success
+   virtual bool StartWatchingFD(int fd) = 0;
+@@ -91,7 +93,18 @@ class WaylandEventWatcher {
+   // failed.
+   void WlDisplayDispatchPendingQueue();
+ 
++  // See |cooperative_dispatch_|. Exposed for platform-specific subclasses.
++  bool cooperative_dispatch() const { return cooperative_dispatch_; }
++
+  private:
++  // Cooperative variant of RoundTripQueue() used when sharing the wl_display
++  // with an external owner (e.g. GDK) that may also read the connection fd
++  // (CEF #2804). A blocking wl_display_roundtrip_queue races that reader and
++  // can block forever; this pumps one bounded cycle instead (dispatch queued
++  // events, read the fd only via prepare_read/read_events, poll with a
++  // timeout). Callers loop on their own completion condition.
++  void RoundTripQueueCooperative();
++
+   void StartProcessingEventsThread();
+   void StartProcessingEventsInternal();
+   void StopProcessingEventsInternal();
+@@ -112,6 +125,13 @@ class WaylandEventWatcher {
+   // Use threaded polling to support --in-process-gpu with EGL wayland backend.
+   bool use_threaded_polling_ = false;
+ 
++  // CEF issue #2804: when true, this watcher shares its wl_display connection
++  // with an external owner (e.g. the embedding app's GTK/GDK), which is the
++  // sole reader of the fd. In this mode the watcher does NOT prepare_read or
++  // read_events (that would race the external reader); it only dispatches its
++  // own event queue's already-distributed events.
++  bool cooperative_dispatch_ = false;
++
+   // Used to verify watching the fd happens on a valid thread.
+   THREAD_CHECKER(thread_checker_);
+ 
+diff --git ui/events/platform/wayland/wayland_event_watcher_fdwatch.cc ui/events/platform/wayland/wayland_event_watcher_fdwatch.cc
+index 6762d7c15f790b12fe1b0a62e5b08a06afa7e4d8..34bb6cc0bfc62969420816478f9f94f7fa1411ee 100644
+--- ui/events/platform/wayland/wayland_event_watcher_fdwatch.cc
++++ ui/events/platform/wayland/wayland_event_watcher_fdwatch.cc
+@@ -12,8 +12,12 @@ namespace ui {
+ WaylandEventWatcherFdWatch::WaylandEventWatcherFdWatch(
+     wl_display* display,
+     wl_event_queue* event_queue,
+-    bool use_threaded_polling)
+-    : WaylandEventWatcher(display, event_queue, use_threaded_polling),
++    bool use_threaded_polling,
++    bool cooperative_dispatch)
++    : WaylandEventWatcher(display,
++                          event_queue,
++                          use_threaded_polling,
++                          cooperative_dispatch),
+       controller_(FROM_HERE) {}
+ 
+ WaylandEventWatcherFdWatch::~WaylandEventWatcherFdWatch() {
+@@ -22,7 +26,10 @@ WaylandEventWatcherFdWatch::~WaylandEventWatcherFdWatch() {
+ 
+ bool WaylandEventWatcherFdWatch::StartWatchingFD(int fd) {
+   DCHECK(base::CurrentUIThread::IsSet());
+-  WlDisplayPrepareToRead();
++  // In cooperative mode the external owner reads the fd; don't prepare_read.
++  if (!cooperative_dispatch()) {
++    WlDisplayPrepareToRead();
++  }
+   return base::CurrentUIThread::Get()->WatchFileDescriptor(
+       fd, true, base::MessagePumpForUI::WATCH_READ, &controller_, this);
+ }
+@@ -43,6 +50,14 @@ void WaylandEventWatcherFdWatch::OnFileCanReadWithoutBlocking(int fd) {
+   // these methods. At the moment, they are constantly called whenever there is
+   // something to read, which is inefficient. See WaylandEventWatcherGlib for
+   // example.
++  // In cooperative mode the external owner reads the fd and distributes events
++  // to our queue; we only dispatch our queue (no read/prepare, which would race
++  // the external reader). See CEF issue #2804.
++  if (cooperative_dispatch()) {
++    WlDisplayDispatchPendingQueue();
++    return;
++  }
++
+   WlDisplayReadEvents();
+   WlDisplayDispatchPendingQueue();
+ 
+@@ -60,9 +75,10 @@ void WaylandEventWatcherFdWatch::OnFileCanWriteWithoutBlocking(int fd) {
+ std::unique_ptr<WaylandEventWatcher>
+ WaylandEventWatcher::CreateWaylandEventWatcher(wl_display* display,
+                                                wl_event_queue* event_queue,
+-                                               bool use_threaded_polling) {
+-  return std::make_unique<WaylandEventWatcherFdWatch>(display, event_queue,
+-                                                      use_threaded_polling);
++                                               bool use_threaded_polling,
++                                               bool cooperative_dispatch) {
++  return std::make_unique<WaylandEventWatcherFdWatch>(
++      display, event_queue, use_threaded_polling, cooperative_dispatch);
+ }
+ 
+ }  // namespace ui
+diff --git ui/events/platform/wayland/wayland_event_watcher_fdwatch.h ui/events/platform/wayland/wayland_event_watcher_fdwatch.h
+index 07e16dd98e5e2be0ab5a92423b3f939189d5e680..7dd0fa7fb14baf0cbc6806003c879d63e01a14a9 100644
+--- ui/events/platform/wayland/wayland_event_watcher_fdwatch.h
++++ ui/events/platform/wayland/wayland_event_watcher_fdwatch.h
+@@ -16,7 +16,8 @@ class WaylandEventWatcherFdWatch : public WaylandEventWatcher,
+  public:
+   WaylandEventWatcherFdWatch(wl_display* display,
+                              wl_event_queue* event_queue,
+-                             bool use_threaded_polling);
++                             bool use_threaded_polling,
++                             bool cooperative_dispatch);
+   WaylandEventWatcherFdWatch(const WaylandEventWatcherFdWatch&) = delete;
+   WaylandEventWatcherFdWatch& operator=(const WaylandEventWatcherFdWatch&) =
+       delete;
+diff --git ui/events/platform/wayland/wayland_event_watcher_glib.cc ui/events/platform/wayland/wayland_event_watcher_glib.cc
+index 803b48f892e7f2f396e4cc0aaf007ba4e5f201a9..da0c4df569f303be778e38d999c35b6a542bc7af 100644
+--- ui/events/platform/wayland/wayland_event_watcher_glib.cc
++++ ui/events/platform/wayland/wayland_event_watcher_glib.cc
+@@ -17,6 +17,12 @@ namespace {
+ // the same priority as MessagePumpGlib for fd watching.
+ constexpr int kPriorityFdWatch = G_PRIORITY_DEFAULT_IDLE - 10;
+ 
++// In cooperative mode we don't poll the fd ourselves (the external owner reads
++// it); instead we wake on this timer to dispatch our already-distributed queue.
++// The loop also wakes whenever the external owner's fd source fires, so this is
++// only a fallback bound on dispatch latency. See CEF issue #2804.
++constexpr int kCooperativeDispatchTimeoutMs = 8;
++
+ struct GLibWaylandSource : public GSource {
+   // Note: The GLibWaylandSource is created and destroyed by GLib. So its
+   // constructor/destructor will not get called.
+@@ -25,11 +31,20 @@ struct GLibWaylandSource : public GSource {
+ };
+ 
+ gboolean WatchSourcePrepare(GSource* source, gint* timeout_ms) {
++  auto* event_watcher_glib =
++      static_cast<GLibWaylandSource*>(source)->event_watcher.get();
++
++  // Cooperative mode: don't poll/read the fd (the external owner does). Wake on
++  // a short timer to dispatch our queue; the loop also wakes on the owner's fd
++  // source, so dispatch is effectively event-driven with this as a bound.
++  if (event_watcher_glib->cooperative()) {
++    *timeout_ms = kCooperativeDispatchTimeoutMs;
++    return FALSE;
++  }
++
+   // Set an infinite timeout.
+   *timeout_ms = -1;
+ 
+-  auto* event_watcher_glib =
+-      static_cast<GLibWaylandSource*>(source)->event_watcher.get();
+   if (event_watcher_glib->HandlePrepare()) {
+     return FALSE;
+   }
+@@ -40,6 +55,11 @@ gboolean WatchSourcePrepare(GSource* source, gint* timeout_ms) {
+ 
+ gboolean WatchSourceCheck(GSource* source) {
+   auto* glib_wayland_source = static_cast<GLibWaylandSource*>(source);
++  // Cooperative mode has no poll fd; always dispatch (HandleDispatch will
++  // dispatch our queue's already-distributed events).
++  if (glib_wayland_source->event_watcher->cooperative()) {
++    return TRUE;
++  }
+   gushort flags = glib_wayland_source->poll_fd->revents;
+   glib_wayland_source->event_watcher->HandleCheck(flags & G_IO_IN);
+   return flags;
+@@ -74,8 +94,12 @@ GSourceFuncs WatchSourceFuncs = {
+ 
+ WaylandEventWatcherGlib::WaylandEventWatcherGlib(wl_display* display,
+                                                  wl_event_queue* event_queue,
+-                                                 bool use_threaded_polling)
+-    : WaylandEventWatcher(display, event_queue, use_threaded_polling) {}
++                                                 bool use_threaded_polling,
++                                                 bool cooperative_dispatch)
++    : WaylandEventWatcher(display,
++                          event_queue,
++                          use_threaded_polling,
++                          cooperative_dispatch) {}
+ 
+ WaylandEventWatcherGlib::~WaylandEventWatcherGlib() {
+   StopProcessingEvents();
+@@ -97,7 +121,12 @@ bool WaylandEventWatcherGlib::StartWatchingFD(int fd) {
+   glib_wayland_source->poll_fd = wayland_poll_.get();
+ 
+   wayland_source_ = glib_wayland_source;
+-  g_source_add_poll(wayland_source_, wayland_poll_.get());
++  // In cooperative mode we do NOT watch the fd (the external owner is the sole
++  // reader). The source is driven by the timer in WatchSourcePrepare and by the
++  // loop waking on the owner's fd source. See CEF issue #2804.
++  if (!cooperative_dispatch()) {
++    g_source_add_poll(wayland_source_, wayland_poll_.get());
++  }
+   g_source_set_can_recurse(wayland_source_, TRUE);
+   auto* context = g_main_context_get_thread_default();
+   if (!context) {
+@@ -122,10 +151,12 @@ void WaylandEventWatcherGlib::StopWatchingFD() {
+ }
+ 
+ bool WaylandEventWatcherGlib::HandlePrepare() {
++  // Not reached in cooperative mode (WatchSourcePrepare handles that).
+   return WlDisplayPrepareToRead();
+ }
+ 
+ void WaylandEventWatcherGlib::HandleCheck(bool is_io_in) {
++  // Not reached in cooperative mode (WatchSourceCheck handles that).
+   if (is_io_in) {
+     WlDisplayReadEvents();
+   } else {
+@@ -137,13 +168,18 @@ void WaylandEventWatcherGlib::HandleDispatch() {
+   WlDisplayDispatchPendingQueue();
+ }
+ 
++bool WaylandEventWatcherGlib::cooperative() const {
++  return cooperative_dispatch();
++}
++
+ // static
+ std::unique_ptr<WaylandEventWatcher>
+ WaylandEventWatcher::CreateWaylandEventWatcher(wl_display* display,
+                                                wl_event_queue* event_queue,
+-                                               bool use_threaded_polling) {
+-  return std::make_unique<WaylandEventWatcherGlib>(display, event_queue,
+-                                                   use_threaded_polling);
++                                               bool use_threaded_polling,
++                                               bool cooperative_dispatch) {
++  return std::make_unique<WaylandEventWatcherGlib>(
++      display, event_queue, use_threaded_polling, cooperative_dispatch);
+ }
+ 
+ }  // namespace ui
+diff --git ui/events/platform/wayland/wayland_event_watcher_glib.h ui/events/platform/wayland/wayland_event_watcher_glib.h
+index 3ae5b4ade49efad3fa416f78054a2700a952f4d7..c2e77544568bf5f35e448ec576c822e85df13638 100644
+--- ui/events/platform/wayland/wayland_event_watcher_glib.h
++++ ui/events/platform/wayland/wayland_event_watcher_glib.h
+@@ -20,7 +20,8 @@ class WaylandEventWatcherGlib : public WaylandEventWatcher {
+  public:
+   WaylandEventWatcherGlib(wl_display* display,
+                           wl_event_queue* event_queue,
+-                          bool use_threaded_polling);
++                          bool use_threaded_polling,
++                          bool cooperative_dispatch);
+   WaylandEventWatcherGlib(const WaylandEventWatcherGlib&) = delete;
+   WaylandEventWatcherGlib& operator=(const WaylandEventWatcherGlib&) = delete;
+   ~WaylandEventWatcherGlib() override;
+@@ -32,6 +33,11 @@ class WaylandEventWatcherGlib : public WaylandEventWatcher {
+   // Handles WatchSourceDispatch.
+   void HandleDispatch();
+ 
++  // True when sharing the connection with an external owner (e.g. GDK) that is
++  // the sole fd reader; in this mode we dispatch our queue from the loop on a
++  // timer instead of polling/reading the fd ourselves. See CEF issue #2804.
++  bool cooperative() const;
++
+  private:
+   // WaylandEventWatcher override;
+   bool StartWatchingFD(int fd) override;
+diff --git ui/ozone/platform/wayland/BUILD.gn ui/ozone/platform/wayland/BUILD.gn
+index 8e2d3051633ac3560071bfe7beba6007851d8c92..3d8232c3b45f886e1b966f4c151ef4e229a91adc 100644
+--- ui/ozone/platform/wayland/BUILD.gn
++++ ui/ozone/platform/wayland/BUILD.gn
+@@ -121,6 +121,8 @@ source_set("wayland") {
+     "host/wayland_data_source.h",
+     "host/wayland_drm.cc",
+     "host/wayland_drm.h",
++    "host/wayland_embedded_window.cc",
++    "host/wayland_embedded_window.h",
+     "host/wayland_event_source.cc",
+     "host/wayland_event_source.h",
+     "host/wayland_exchange_data_provider.cc",
+diff --git ui/ozone/platform/wayland/common/wayland_util.cc ui/ozone/platform/wayland/common/wayland_util.cc
+index 193888cefc1846d2b3a22fbab9d76c5907c3a24b..55255df3a83048b70e7b7f36268789debc2151f6 100644
+--- ui/ozone/platform/wayland/common/wayland_util.cc
++++ ui/ozone/platform/wayland/common/wayland_util.cc
+@@ -270,9 +270,30 @@ gfx::SizeF ApplyWaylandTransform(const gfx::SizeF& size,
+   return result;
+ }
+ 
++namespace {
++// Address used as the proxy tag identifying Ozone-created wl_surfaces. Only the
++// address is significant; the string is for debuggability. See CEF issue #2804.
++const char* const kOzoneWaylandSurfaceTag = "ozone_wl_surface";
++}  // namespace
++
++void TagAsOzoneWaylandSurface(wl_surface* surface) {
++  DCHECK(surface);
++  wl_proxy_set_tag(reinterpret_cast<wl_proxy*>(surface),
++                   &kOzoneWaylandSurfaceTag);
++}
++
+ ui::WaylandWindow* RootWindowFromWlSurface(wl_surface* surface) {
+   if (!surface)
+     return nullptr;
++  // On a shared wl_display (CEF issue #2804) the compositor may deliver foreign
++  // surfaces (e.g. GDK's) to our seat's input listeners. Those have foreign
++  // user_data, so blindly casting it to ui::WaylandSurface* and dereferencing
++  // it crashes. Only surfaces we tagged in WaylandSurface::Initialize carry our
++  // proxy tag; ignore anything else.
++  if (wl_proxy_get_tag(reinterpret_cast<wl_proxy*>(surface)) !=
++      &kOzoneWaylandSurfaceTag) {
++    return nullptr;
++  }
+   auto* wayland_surface = static_cast<ui::WaylandSurface*>(
+       wl_proxy_get_user_data(reinterpret_cast<wl_proxy*>(surface)));
+   if (!wayland_surface)
+diff --git ui/ozone/platform/wayland/common/wayland_util.h ui/ozone/platform/wayland/common/wayland_util.h
+index a91aa52f38f7349f034210c16e0a2997da2827e1..9cb9658b2d6f1fcc3ebbc97d2b9a434f12a89b81 100644
+--- ui/ozone/platform/wayland/common/wayland_util.h
++++ ui/ozone/platform/wayland/common/wayland_util.h
+@@ -94,7 +94,14 @@ gfx::RectF ApplyWaylandTransform(const gfx::RectF& rect,
+ gfx::SizeF ApplyWaylandTransform(const gfx::SizeF& size,
+                                  wl_output_transform transform);
+ 
+-// Returns the root WaylandWindow for the given wl_surface.
++// Tags |surface| as an Ozone-created wl_surface. On a shared wl_display (CEF
++// issue #2804) the compositor may deliver foreign surfaces (e.g. GDK's) to our
++// input listeners; only tagged surfaces have a ui::WaylandSurface as user_data,
++// so RootWindowFromWlSurface() resolves only those and returns null otherwise.
++void TagAsOzoneWaylandSurface(wl_surface* surface);
++
++// Returns the root WaylandWindow for the given wl_surface, or null if |surface|
++// is null or not an Ozone-created (tagged) surface.
+ ui::WaylandWindow* RootWindowFromWlSurface(wl_surface* surface);
+ 
+ // Returns bounds of the given window, adjusted to its subsurface. We need to
+diff --git ui/ozone/platform/wayland/host/wayland_connection.cc ui/ozone/platform/wayland/host/wayland_connection.cc
+index 4c44eaeebe091906a1676da106faa9072819b67e..28629f34fc9bfa18fa394ec36ae140855ed4ef9c 100644
+--- ui/ozone/platform/wayland/host/wayland_connection.cc
++++ ui/ozone/platform/wayland/host/wayland_connection.cc
+@@ -143,7 +143,8 @@ WaylandConnection::~WaylandConnection() {
+   }
+ }
+ 
+-bool WaylandConnection::Initialize(bool use_threaded_polling) {
++bool WaylandConnection::Initialize(bool use_threaded_polling,
++                                   wl_display* external_display) {
+   // Register factories for classes that implement wl::GlobalObjectRegistrar<T>.
+   // Keep alphabetical order for convenience.
+   RegisterGlobalObjectFactory(FractionalScaleManager::kInterfaceName,
+@@ -197,10 +198,19 @@ bool WaylandConnection::Initialize(bool use_threaded_polling) {
+   RegisterGlobalObjectFactory(ZwpPrimarySelectionDeviceManager::kInterfaceName,
+                               &ZwpPrimarySelectionDeviceManager::Instantiate);
+ 
+-  display_.reset(wl_display_connect(nullptr));
+-  if (!display_) {
+-    PLOG(ERROR) << "Failed to connect to Wayland display";
+-    return false;
++  if (external_display) {
++    // Adopt the embedder's existing connection. |display_| is intentionally
++    // left empty so that its deleter (wl_display_disconnect) does not run on
++    // the embedder-owned display. All display operations go through display(),
++    // which returns |external_display_| in this case. Ozone still creates its
++    // own event queue (below) so it does not consume the embedder's events.
++    external_display_ = external_display;
++  } else {
++    display_.reset(wl_display_connect(nullptr));
++    if (!display_) {
++      PLOG(ERROR) << "Failed to connect to Wayland display";
++      return false;
++    }
+   }
+ 
+   wrapped_display_.reset(
+@@ -226,7 +236,8 @@ bool WaylandConnection::Initialize(bool use_threaded_polling) {
+   DCHECK(!event_source_);
+   event_source_ = std::make_unique<WaylandEventSource>(
+       display(), event_queue_.get(), window_manager(), this,
+-      use_threaded_polling);
++      use_threaded_polling,
++      /*cooperative_dispatch=*/!!external_display_);
+ 
+   // Create the buffer factory before registry listener is set so that shm, drm,
+   // zwp_linux_dmabuf objects are able to be stored.
+@@ -248,8 +259,27 @@ bool WaylandConnection::Initialize(bool use_threaded_polling) {
+   // `RoundTripQueue()` internally calls `wl_display_roundtrip_queue()`, which
+   // blocks until wl_display.sync is done. Use it to ensure the required globals
+   // are emitted.
++  // This normally completes within a few milliseconds. On a shared/external
++  // display (CEF issue #2804) some compositors intermittently delay or omit the
++  // wl_output metrics (wl_output.done) for our secondary output binding. Since
++  // this loop runs before the UI message loop starts -- Ozone is the sole
++  // reader of the connection here -- a missing done would hang startup forever.
++  // Bound the wait for the embedding case: the wl_compositor global is
++  // mandatory, but proceed without a fully-configured output once a deadline
++  // passes. Any output that becomes ready later self-registers with the screen
++  // via WaylandOutput::OnDone -> TriggerDelegateNotifications().
++  const bool bounded_wait = !!external_display_;
++  const base::TimeTicks globals_deadline =
++      base::TimeTicks::Now() + base::Seconds(3);
+   while (!WlGlobalsReady()) {
+     RoundTripQueue();
++    if (bounded_wait && compositor_ &&
++        base::TimeTicks::Now() >= globals_deadline) {
++      LOG(WARNING) << "Wayland: proceeding without a fully-configured output "
++                      "on a shared display (e.g. no active monitor); it will "
++                      "be configured once events flow. See CEF issue #2804.";
++      break;
++    }
+   }
+ 
+   buffer_manager_host_ = std::make_unique<WaylandBufferManagerHost>(this);
+@@ -335,6 +365,24 @@ wl::Object<wl_surface> WaylandConnection::CreateSurface() {
+       wl_compositor_create_surface(compositor_.get()));
+ }
+ 
++bool WaylandConnection::CanCreateSubsurface(wl_surface* parent_surface) const {
++  if (!parent_surface) {
++    LOG(ERROR) << "Wayland embedding requires a non-null parent wl_surface";
++    return false;
++  }
++  if (wl_proxy_get_display(reinterpret_cast<wl_proxy*>(parent_surface)) !=
++      display()) {
++    LOG(ERROR) << "Wayland embedding parent surface belongs to a different "
++                  "wl_display connection";
++    return false;
++  }
++  if (!subcompositor_) {
++    LOG(ERROR) << "Wayland embedding requires wl_subcompositor support";
++    return false;
++  }
++  return true;
++}
++
+ void WaylandConnection::RegisterGlobalObjectFactory(
+     const char* interface_name,
+     wl::GlobalObjectFactory factory) {
+diff --git ui/ozone/platform/wayland/host/wayland_connection.h ui/ozone/platform/wayland/host/wayland_connection.h
+index 241a1e5ae9c5c176d8424b08d6f691f2e9fa94b3..c67e1bcf2ca668159918abe7ac9d2c42843cb95a 100644
+--- ui/ozone/platform/wayland/host/wayland_connection.h
++++ ui/ozone/platform/wayland/host/wayland_connection.h
+@@ -78,7 +78,12 @@ class WaylandConnection {
+   WaylandConnection& operator=(const WaylandConnection&) = delete;
+   ~WaylandConnection();
+ 
+-  bool Initialize(bool use_threaded_polling = false);
++  // |external_display| is an optional externally-owned wl_display provided by
++  // an embedder (see OzonePlatform::SetExternalWaylandDisplayForEmbedding). When
++  // non-null, this connection adopts it instead of calling wl_display_connect()
++  // and does not disconnect it on teardown.
++  bool Initialize(bool use_threaded_polling = false,
++                  wl_display* external_display = nullptr);
+ 
+   // Immediately flushes the Wayland display.
+   void Flush();
+@@ -96,6 +101,13 @@ class WaylandConnection {
+   // version binded).
+   uint32_t compositor_version() const { return compositor_version_; }
+   wl_subcompositor* subcompositor() const { return subcompositor_.get(); }
++  bool uses_external_display() const { return !!external_display_; }
++
++  // Returns true if |parent_surface| belongs to this connection and the
++  // compositor supports creation of wl_subsurface objects. Logs a diagnostic
++  // and returns false for invalid input instead of relying on DCHECKs that are
++  // compiled out of release builds.
++  bool CanCreateSubsurface(wl_surface* parent_surface) const;
+   wp_content_type_manager_v1* content_type_manager_v1() const {
+     return content_type_manager_v1_.get();
+   }
+@@ -342,7 +354,9 @@ class WaylandConnection {
+   // various wayland objects must use |display_wrapper_| so that the new objects
+   // are associated with the correct event queue. See the comment below about
+   // the |event_queue_|.
+-  wl_display* display() const { return display_.get(); }
++  wl_display* display() const {
++    return display_ ? display_.get() : external_display_.get();
++  }
+   wl_display* display_wrapper() const {
+     return reinterpret_cast<wl_display*>(wrapped_display_.get());
+   }
+@@ -396,6 +410,12 @@ class WaylandConnection {
+ 
+   uint32_t compositor_version_ = 0;
+   wl::Object<wl_display> display_;
++  // When non-null, an externally-owned wl_display provided by an embedder via
++  // OzonePlatform::SetExternalWaylandDisplayForEmbedding(). In that case
++  // |display_| is left empty so that it is not disconnected on teardown, and
++  // this connection is used for all display operations instead. Not owned; the
++  // embedder must keep it alive for the lifetime of this connection.
++  raw_ptr<wl_display, DisableDanglingPtrDetection> external_display_ = nullptr;
+   // `event_queue_` must be declared before `wrapped_display_`, so that the
+   // latter is destroyed first. This prevents libwayland warnings about the
+   // queue being destroyed while the proxy is still attached.
+diff --git ui/ozone/platform/wayland/host/wayland_embedded_window.cc ui/ozone/platform/wayland/host/wayland_embedded_window.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..6b756532a5cc35c383f881eaf2301c0bef4bedcd
+--- /dev/null
++++ ui/ozone/platform/wayland/host/wayland_embedded_window.cc
+@@ -0,0 +1,237 @@
++// Copyright 2026 The Chromium Embedded Framework Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "ui/ozone/platform/wayland/host/wayland_embedded_window.h"
++
++#include "base/functional/bind.h"
++#include "base/logging.h"
++#include "base/task/single_thread_task_runner.h"
++#include "ui/gfx/geometry/rect.h"
++#include "ui/ozone/platform/wayland/common/wayland_object.h"
++#include "ui/ozone/platform/wayland/host/wayland_connection.h"
++#include "ui/ozone/platform/wayland/host/wayland_output.h"
++#include "ui/ozone/platform/wayland/host/wayland_output_manager.h"
++#include "ui/ozone/platform/wayland/host/wayland_surface.h"
++#include "ui/ozone/platform/wayland/host/wayland_window_manager.h"
++#include "ui/platform_window/platform_window_init_properties.h"
++
++namespace ui {
++
++WaylandEmbeddedWindow::WaylandEmbeddedWindow(PlatformWindowDelegate* delegate,
++                                             WaylandConnection* connection)
++    : WaylandWindow(delegate, connection) {}
++
++void WaylandEmbeddedWindow::Show(bool inactive) {
++  if (subsurface_) {
++    return;
++  }
++  if (!CreateSubsurface()) {
++    // Surface creation normally succeeds after OnInitialize validation. If the
++    // protocol constructor still fails, propagate the failure through the
++    // standard platform-window close path instead of dereferencing a null
++    // wl_subsurface in release builds. Defer Close(): the Views OnClosed path
++    // may synchronously destroy the host and Widget, whose Show() frames are
++    // still active above us.
++    base::SingleThreadTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(&WaylandEmbeddedWindow::Close,
++                                  weak_ptr_factory_.GetWeakPtr()));
++    return;
++  }
++  WaylandWindow::Show(inactive);
++  // A wl_subsurface receives no server configure event, which is what normally
++  // drives a toplevel to request its initial state and kick viz into producing
++  // the first frame. Do it explicitly now that the subsurface exists (and so
++  // OnSequencePoint won't drop the resulting sequence point).
++  RequestStateFromClient(applied_state());
++}
++
++void WaylandEmbeddedWindow::Hide() {
++  if (!subsurface_) {
++    return;
++  }
++  WaylandWindow::Hide();
++  subsurface_.reset();
++  connection()->Flush();
++}
++
++void WaylandEmbeddedWindow::Close() {
++  if (close_notified_) {
++    return;
++  }
++  close_notified_ = true;
++  WaylandWindow::Close();
++}
++
++WaylandEmbeddedWindow::~WaylandEmbeddedWindow() = default;
++
++bool WaylandEmbeddedWindow::IsVisible() const {
++  return !!subsurface_;
++}
++
++void WaylandEmbeddedWindow::SetBoundsInDIP(const gfx::Rect& bounds_dip) {
++  // The Aura/widget bounds must remain zero-origin. Placement relative to the
++  // external parent belongs exclusively to |subsurface_offset_| and changing
++  // it would additionally require the embedder to commit the parent surface.
++  // A desynchronized child applies buffer/viewport size changes on its own
++  // surface commit, so pure resize must not resend wl_subsurface.set_position.
++  WaylandWindow::SetBoundsInDIP(gfx::Rect(bounds_dip.size()));
++}
++
++void WaylandEmbeddedWindow::OnSequencePoint(int64_t seq) {
++  if (!subsurface_) {
++    return;
++  }
++  ProcessSequencePoint(seq);
++  MaybeApplyLatestStateRequest(/*force=*/false);
++}
++
++base::WeakPtr<WaylandWindow> WaylandEmbeddedWindow::AsWeakPtr() {
++  return weak_ptr_factory_.GetWeakPtr();
++}
++
++float WaylandEmbeddedWindow::EmbeddedScale() const {
++  // Use the compositor's FRACTIONAL per-surface scale (wp_fractional_scale_v1)
++  // so the buffer is painted at the exact device resolution and presented via
++  // wp_viewport (buffer_scale=1, viewport destination = logical size) -- crisp,
++  // 1:1 with the physical display. This mirrors Firefox's MozContainer
++  // subsurface (widget/gtk/WaylandSurface.cpp). A wl_subsurface may not receive
++  // preferred_scale immediately (or at all on some compositors), so fall back
++  // to the primary output's (also fractional) scale. See CEF issue #2804.
++  // Base class returns the raw wp_fractional_scale preferred_scale (null for a
++  // subsurface). NOTE: call the base explicitly -- our override delegates back
++  // here, so calling the virtual would recurse infinitely.
++  if (auto preferred = WaylandWindow::GetPreferredScaleFactor();
++      preferred && *preferred > 0.f) {
++    return *preferred;
++  }
++  if (auto* output_manager = connection()->wayland_output_manager()) {
++    if (auto* output = output_manager->GetPrimaryOutput()) {
++      const float scale = output->scale_factor();
++      if (scale > 0.f) {
++        return scale;
++      }
++    }
++  }
++  return 1.0f;
++}
++
++std::optional<float> WaylandEmbeddedWindow::GetPreferredScaleFactor() const {
++  return EmbeddedScale();
++}
++
++void WaylandEmbeddedWindow::UpdateWindowScale(bool update_bounds) {
++  // Base behavior maps to GetPreferredScaleFactor().value_or(1.0); the 1.0
++  // fallback would be wrong (blurry/undersized) before the subsurface's first
++  // preferred_scale arrives, so route through EmbeddedScale() which falls back
++  // to the output's fractional scale instead. See CEF issue #2804.
++  SetWindowScale(EmbeddedScale());
++}
++
++bool WaylandEmbeddedWindow::OnInitialize(
++    PlatformWindowInitProperties properties,
++    PlatformWindowDelegate::State* state) {
++  external_parent_surface_ =
++      static_cast<wl_surface*>(properties.parent_wayland_surface);
++  if (!connection()->CanCreateSubsurface(external_parent_surface_)) {
++    return false;
++  }
++
++  // Where the subsurface sits within the embedder's content area. The window's
++  // own bounds stay zero-origin (a non-zero origin marks it off-root and
++  // occlusion tracking stops frame production); this offset positions the
++  // subsurface independently. See CEF issue #2804.
++  subsurface_offset_ = properties.wayland_subsurface_offset;
++
++  // An embedded window is always in the normal state.
++  state->window_state = PlatformWindowState::kNormal;
++
++  // Seed the scale so the first buffer is produced at the right resolution
++  // (a wl_subsurface gets no wl_surface.enter, and preferred_scale may arrive
++  // only after the first commit). EmbeddedScale() returns the fractional scale
++  // for crisp wp_viewport-based rendering. See CEF issue #2804.
++  state->window_scale = EmbeddedScale();
++  return true;
++}
++
++bool WaylandEmbeddedWindow::IsSurfaceConfigured() {
++  // A wl_subsurface receives no configure events and is considered configured
++  // as soon as it has a wl_subsurface handle. The external parent surface is
++  // assumed to be mapped by the embedder.
++  return !!subsurface_;
++}
++
++void WaylandEmbeddedWindow::UpdateWindowMask() {
++  // Embedded window has no shape; only update opaqueness.
++  auto region = IsOpaqueWindow() ? std::optional<std::vector<gfx::Rect>>(
++                                       {gfx::Rect(latched_state().size_px)})
++                                 : std::nullopt;
++  root_surface()->set_opaque_region(region);
++}
++
++bool WaylandEmbeddedWindow::CreateSubsurface() {
++  // Parent our root surface to the embedder's external wl_surface.
++  subsurface_ = root_surface()->CreateSubsurface(external_parent_surface_);
++  if (!subsurface_) {
++    return false;
++  }
++
++  SetSubsurfacePosition();
++
++  // The embedded browser has its own ui::Compositor and receives BeginFrames
++  // independently from the host. Desync mode lets our commits become visible
++  // without requiring a parent-surface commit for each frame.
++  wl_subsurface_set_desync(subsurface_.get());
++
++  // Set a genuinely EMPTY input region so the compositor never delivers
++  // pointer/touch to this subsurface. On a shared wl_seat (CEF #2804) GDK also
++  // has a wl_pointer on the same seat; if the pointer enters our subsurface the
++  // compositor sends wl_pointer.enter(our_surface) to GDK too, and GDK crashes
++  // running GDK_IS_WINDOW() on our surface's (non-GObject) user_data.
++  //
++  // NOTE: WaylandSurface::set_input_region() maps an EMPTY vector to a NULL
++  // region == the WHOLE surface (accept all input) -- the opposite of what we
++  // want. A vector holding one zero-size rect instead yields a truly empty
++  // wl_region (CreateAndAddRegion adds a 0x0 area = no pixels). Firefox does
++  // the equivalent in WaylandSurface::DisableUserInputLocked().
++  // TODO(cef #2804): route host seat input to the embedded browser instead of
++  // dropping it (the proper fix); for now the browser renders but is not
++  // pointer-interactive.
++  root_surface()->set_input_region(std::vector<gfx::Rect>{gfx::Rect()});
++
++  // wl_subsurface receives no configure events from the server. As soon as the
++  // handle is created it is considered configured, so the frame manager can
++  // start processing frames.
++  OnSurfaceConfigureEvent();
++
++  // Subsurfaces don't send ack-configure events; notify observers immediately.
++  connection()->window_manager()->NotifyWindowConfigured(this);
++  return true;
++}
++
++void WaylandEmbeddedWindow::SetSubsurfacePosition() {
++  // Position within the embedder's surface, in Wayland DIP coordinates. The
++  // window's bounds are kept zero-origin (see OnInitialize), so the placement
++  // comes from |subsurface_offset_| -- the browser's location inside the host's
++  // content area (e.g. below the host's menu/tool bars).
++  wl_subsurface_set_position(subsurface_.get(), subsurface_offset_.x(),
++                             subsurface_offset_.y());
++
++  // A wl_subsurface's state -- including its initial addition to the parent's
++  // surface tree and its position -- is double-buffered against the PARENT
++  // surface and only applied when the embedder next commits ITS OWN surface.
++  //
++  // We deliberately do NOT commit |external_parent_surface_| here: it is owned
++  // and driven by the embedding toolkit (e.g. GTK/GDK), possibly on another
++  // thread, and committing it from Ozone could prematurely apply the toolkit's
++  // unrelated pending state (attached buffer, damage, viewport, input region,
++  // frame callbacks) or race the toolkit's own commit. Instead the embedder is
++  // responsible for committing its surface to latch our changes -- e.g. by
++  // invalidating its GDK window, which is what Firefox does in
++  // MozContainerWayland (widget/gtk). We only flush so our own batched requests
++  // (get_subsurface/set_position/attach/...) reach the server before that
++  // parent commit arrives. See CEF issue #2804.
++  connection()->Flush();
++}
++
++}  // namespace ui
+diff --git ui/ozone/platform/wayland/host/wayland_embedded_window.h ui/ozone/platform/wayland/host/wayland_embedded_window.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..280dfc1ab7900da93c06afac24797dffdd2f89c4
+--- /dev/null
++++ ui/ozone/platform/wayland/host/wayland_embedded_window.h
+@@ -0,0 +1,99 @@
++// Copyright 2026 The Chromium Embedded Framework Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef UI_OZONE_PLATFORM_WAYLAND_HOST_WAYLAND_EMBEDDED_WINDOW_H_
++#define UI_OZONE_PLATFORM_WAYLAND_HOST_WAYLAND_EMBEDDED_WINDOW_H_
++
++#include "base/memory/weak_ptr.h"
++#include "ui/ozone/platform/wayland/host/wayland_window.h"
++#include "ui/platform_window/platform_window_init_properties.h"
++
++struct wl_surface;
++
++namespace ui {
++
++class WaylandConnection;
++
++// A WaylandWindow implementation that embeds a CEF browser into an external
++// application's wl_surface (CEF issue #2804). Like WaylandBubble it is backed
++// by a wl_subsurface, but its parent is a raw wl_surface* owned by the
++// embedding application rather than a Chromium WaylandWindow. The embedder and
++// CEF must share the same wl_display (see
++// OzonePlatform::SetExternalWaylandDisplayForEmbedding()).
++//
++// Unlike WaylandBubble, this window does NOT commit the parent surface: the
++// embedder owns and drives that surface. Subsurface position/state changes are
++// latched when the embedder next commits its own surface.
++class WaylandEmbeddedWindow final : public WaylandWindow {
++ public:
++  WaylandEmbeddedWindow(PlatformWindowDelegate* delegate,
++                        WaylandConnection* connection);
++  WaylandEmbeddedWindow(const WaylandEmbeddedWindow&) = delete;
++  WaylandEmbeddedWindow& operator=(const WaylandEmbeddedWindow&) = delete;
++  ~WaylandEmbeddedWindow() override;
++
++  wl_surface* external_parent_surface() const {
++    return external_parent_surface_;
++  }
++
++  // PlatformWindow overrides:
++  void Show(bool inactive) override;
++  void Hide() override;
++  void Close() override;
++  bool IsVisible() const override;
++  void SetBoundsInDIP(const gfx::Rect& bounds) override;
++
++  // WaylandWindow overrides:
++  void OnSequencePoint(int64_t seq) override;
++  void AckConfigure(uint32_t serial) override {}
++  base::WeakPtr<WaylandWindow> AsWeakPtr() override;
++  void UpdateWindowScale(bool update_bounds) override;
++  // A wl_subsurface does not receive wp_fractional_scale_v1 preferred_scale, so
++  // the base class's raw preferred scale is null and the aura/viz device scale
++  // factor (WaylandScreen::GetPreferredScaleFactorForAcceleratedWidget) would
++  // default to 1.0 -- making the browser render at 1x and the compositor
++  // upscale it (blurry). Return the effective embedded scale instead so viz
++  // renders at the fractional scale (crisp). See CEF issue #2804.
++  std::optional<float> GetPreferredScaleFactor() const override;
++
++ private:
++  // WaylandWindow overrides:
++  bool OnInitialize(PlatformWindowInitProperties properties,
++                    PlatformWindowDelegate::State* state) override;
++  bool IsSurfaceConfigured() override;
++  void UpdateWindowMask() override;
++
++  // Creates the wl_subsurface parented to |external_parent_surface_| and marks
++  // the window configured (subsurfaces receive no configure events).
++  bool CreateSubsurface();
++  void SetSubsurfacePosition();
++
++  // The fractional scale to render this embedded window at: the compositor's
++  // per-surface preferred scale (wp_fractional_scale_v1) if known, else the
++  // primary output's fractional scale. Used with wp_viewport for crisp,
++  // 1:1-with-physical rendering. Returns 1.0 if no output is available yet.
++  float EmbeddedScale() const;
++
++  // Externally-owned parent surface. Not owned; kept alive by the embedder.
++  raw_ptr<wl_surface, DisableDanglingPtrDetection> external_parent_surface_ =
++      nullptr;
++
++  // Offset (in DIP) of the subsurface within |external_parent_surface_|, i.e.
++  // where the browser sits inside the host's content area (below its chrome).
++  // The window's own bounds stay zero-origin to keep frame production alive;
++  // this offset positions the subsurface independently. See CEF issue #2804.
++  gfx::Point subsurface_offset_;
++
++  wl::Object<wl_subsurface> subsurface_;
++
++  // PlatformWindow::Close() may be reached more than once while CEF browser
++  // teardown is pending. Notify the delegate exactly once.
++  bool close_notified_ = false;
++
++  base::WeakPtrFactory<WaylandEmbeddedWindow> weak_ptr_factory_{this};
++};
++
++}  // namespace ui
++
++#endif  // UI_OZONE_PLATFORM_WAYLAND_HOST_WAYLAND_EMBEDDED_WINDOW_H_
+diff --git ui/ozone/platform/wayland/host/wayland_event_source.cc ui/ozone/platform/wayland/host/wayland_event_source.cc
+index 5e70540e7226b6cbab684140d89e22ad547db227..c6a5d3284cf591a6b77f16f30242a42e29133338 100644
+--- ui/ozone/platform/wayland/host/wayland_event_source.cc
++++ ui/ozone/platform/wayland/host/wayland_event_source.cc
+@@ -200,13 +200,15 @@ WaylandEventSource::WaylandEventSource(wl_display* display,
+                                        wl_event_queue* event_queue,
+                                        WaylandWindowManager* window_manager,
+                                        WaylandConnection* connection,
+-                                       bool use_threaded_polling)
++                                       bool use_threaded_polling,
++                                       bool cooperative_dispatch)
+     : window_manager_(window_manager),
+       connection_(connection),
+       event_watcher_(WaylandEventWatcher::CreateWaylandEventWatcher(
+           display,
+           event_queue,
+-          use_threaded_polling)) {
++          use_threaded_polling,
++          cooperative_dispatch)) {
+   DCHECK(window_manager_);
+ 
+   // Observes remove changes to know when touch points can be removed.
+diff --git ui/ozone/platform/wayland/host/wayland_event_source.h ui/ozone/platform/wayland/host/wayland_event_source.h
+index 610771d04440fb7aed260e507fcfe5066a7d14ce..5bda5d1ed50144bb77fc5d6335637c9ae053a1b5 100644
+--- ui/ozone/platform/wayland/host/wayland_event_source.h
++++ ui/ozone/platform/wayland/host/wayland_event_source.h
+@@ -66,7 +66,8 @@ class WaylandEventSource : public PlatformEventSource,
+                      wl_event_queue* event_queue,
+                      WaylandWindowManager* window_manager,
+                      WaylandConnection* connection,
+-                     bool use_threaded_polling = false);
++                     bool use_threaded_polling = false,
++                     bool cooperative_dispatch = false);
+   WaylandEventSource(const WaylandEventSource&) = delete;
+   WaylandEventSource& operator=(const WaylandEventSource&) = delete;
+   ~WaylandEventSource() override;
+diff --git ui/ozone/platform/wayland/host/wayland_surface.cc ui/ozone/platform/wayland/host/wayland_surface.cc
+index a8cac5a7123f98a4276cd07f09989a77699e3aa5..f9ed4fc7058c926763356a960df735799827bde3 100644
+--- ui/ozone/platform/wayland/host/wayland_surface.cc
++++ ui/ozone/platform/wayland/host/wayland_surface.cc
+@@ -118,6 +118,11 @@ bool WaylandSurface::Initialize() {
+   if (!surface_)
+     return false;
+ 
++  // Tag this as an Ozone-owned surface so RootWindowFromWlSurface() can tell it
++  // apart from foreign surfaces (e.g. GDK's) delivered by the compositor on a
++  // shared wl_display. See CEF issue #2804.
++  wl::TagAsOzoneWaylandSurface(surface_.get());
++
+   static constexpr wl_surface_listener kSurfaceListener = {
+       .enter = &OnEnter,
+       .leave = &OnLeave,
+@@ -491,11 +496,24 @@ void WaylandSurface::OnFenceAvailable(uint32_t buffer_id,
+ 
+ wl::Object<wl_subsurface> WaylandSurface::CreateSubsurface(
+     WaylandSurface* parent) {
+-  DCHECK(parent);
++  if (!parent) {
++    LOG(ERROR) << "Cannot create a Wayland subsurface without a parent";
++    return {};
++  }
++  return CreateSubsurface(parent->surface_.get());
++}
++
++wl::Object<wl_subsurface> WaylandSurface::CreateSubsurface(
++    wl_surface* parent_surface) {
++  if (!connection_->CanCreateSubsurface(parent_surface)) {
++    return {};
++  }
+   wl_subcompositor* subcompositor = connection_->subcompositor();
+-  DCHECK(subcompositor);
+   wl::Object<wl_subsurface> subsurface(wl_subcompositor_get_subsurface(
+-      subcompositor, surface_.get(), parent->surface_.get()));
++      subcompositor, surface_.get(), parent_surface));
++  if (!subsurface) {
++    LOG(ERROR) << "Failed to create wl_subsurface";
++  }
+   return subsurface;
+ }
+ 
+@@ -850,17 +868,20 @@ void WaylandSurface::OnEnter(void* data,
+     return;
+   }
+ 
+-  auto* wayland_output =
+-      static_cast<WaylandOutput*>(wl_output_get_user_data(output));
+-
+-  DCHECK_NE(self->connection_->wayland_output_manager()->GetOutput(
+-                wayland_output->output_id()),
+-            nullptr);
++  // CEF issue #2804: on a shared display, the compositor may deliver a
++  // wl_output owned by the embedder (e.g. GDK), not Ozone. Resolve it by proxy
++  // pointer (safe) rather than dereferencing wl_output user_data (which would
++  // be the embedder's, not a WaylandOutput), and ignore outputs Ozone does not
++  // own.
++  const WaylandOutput::Id output_id =
++      self->connection_->wayland_output_manager()->GetOutputId(output);
++  if (output_id == 0) {
++    return;
++  }
+ 
+-  if (auto it = std::ranges::find(self->entered_outputs_,
+-                                  wayland_output->output_id());
++  if (auto it = std::ranges::find(self->entered_outputs_, output_id);
+       it == self->entered_outputs_.end()) {
+-    self->entered_outputs_.emplace_back(wayland_output->output_id());
++    self->entered_outputs_.emplace_back(output_id);
+   }
+ 
+   if (self->root_window_) {
+@@ -881,9 +902,13 @@ void WaylandSurface::OnLeave(void* data,
+     return;
+   }
+ 
+-  auto* wayland_output =
+-      static_cast<WaylandOutput*>(wl_output_get_user_data(output));
+-  self->RemoveEnteredOutput(wayland_output->output_id());
++  // See OnEnter: resolve by proxy pointer and ignore non-Ozone outputs.
++  const WaylandOutput::Id output_id =
++      self->connection_->wayland_output_manager()->GetOutputId(output);
++  if (output_id == 0) {
++    return;
++  }
++  self->RemoveEnteredOutput(output_id);
+ }
+ 
+ // static
+diff --git ui/ozone/platform/wayland/host/wayland_surface.h ui/ozone/platform/wayland/host/wayland_surface.h
+index 05a27d1ab70f0e582d7080923867a0dec60d6596..1b8668ecf46c695e8a8522ba68ab067b94c6e82d 100644
+--- ui/ozone/platform/wayland/host/wayland_surface.h
++++ ui/ozone/platform/wayland/host/wayland_surface.h
+@@ -189,6 +189,11 @@ class WaylandSurface {
+   // |parent|. Callers take ownership of the wl_subsurface.
+   wl::Object<wl_subsurface> CreateSubsurface(WaylandSurface* parent);
+ 
++  // CEF (issue #2804): overload that parents to a raw external wl_surface*
++  // owned by an embedding application (not a Chromium WaylandSurface), used for
++  // Wayland window embedding. Callers take ownership of the wl_subsurface.
++  wl::Object<wl_subsurface> CreateSubsurface(wl_surface* parent_surface);
++
+   // When display is removed, the WaylandOutput from `entered_outputs_` should
+   // be removed.
+   void RemoveEnteredOutput(uint32_t id);
+diff --git ui/ozone/platform/wayland/host/wayland_window.h ui/ozone/platform/wayland/host/wayland_window.h
+index 7d82e02ad1b7ab23b006e1a25a0283a49b425159..b06dfb53deda963fad0c5a197e14d6e2e422afb6 100644
+--- ui/ozone/platform/wayland/host/wayland_window.h
++++ ui/ozone/platform/wayland/host/wayland_window.h
+@@ -182,7 +182,7 @@ class WaylandWindow : public PlatformWindow,
+   // as there is no way to figure out what output the window occupies the most.
+   std::optional<WaylandOutput::Id> GetPreferredEnteredOutputId();
+ 
+-  std::optional<float> GetPreferredScaleFactor() const;
++  virtual std::optional<float> GetPreferredScaleFactor() const;
+ 
+   // Returns current type of the window.
+   PlatformWindowType type() const { return type_; }
+diff --git ui/ozone/platform/wayland/host/wayland_window_factory.cc ui/ozone/platform/wayland/host/wayland_window_factory.cc
+index 333b59ff323502c3f5823398c2ac6a871c017d53..eca0ced80ec1832ea49410ffdbdbee94070f1fdc 100644
+--- ui/ozone/platform/wayland/host/wayland_window_factory.cc
++++ ui/ozone/platform/wayland/host/wayland_window_factory.cc
+@@ -7,6 +7,7 @@
+ #include "base/logging.h"
+ #include "ui/ozone/platform/wayland/host/wayland_bubble.h"
+ #include "ui/ozone/platform/wayland/host/wayland_connection.h"
++#include "ui/ozone/platform/wayland/host/wayland_embedded_window.h"
+ #include "ui/ozone/platform/wayland/host/wayland_popup.h"
+ #include "ui/ozone/platform/wayland/host/wayland_toplevel_window.h"
+ #include "ui/ozone/platform/wayland/host/wayland_window.h"
+@@ -48,9 +49,16 @@ std::unique_ptr<WaylandWindow> WaylandWindow::Create(
+       break;
+     case PlatformWindowType::kWindow:
+     case PlatformWindowType::kDrag:
+-      // TODO(crbug.com/40883130): Figure out what kind of surface we need to
+-      // create kDrag windows.
+-      window = std::make_unique<WaylandToplevelWindow>(delegate, connection);
++      if (properties.parent_wayland_surface) {
++        // CEF issue #2804: embed the browser as a wl_subsurface of an external
++        // application's wl_surface.
++        window =
++            std::make_unique<WaylandEmbeddedWindow>(delegate, connection);
++      } else {
++        // TODO(crbug.com/40883130): Figure out what kind of surface we need to
++        // create kDrag windows.
++        window = std::make_unique<WaylandToplevelWindow>(delegate, connection);
++      }
+       break;
+     default:
+       NOTREACHED();
+diff --git ui/ozone/platform/wayland/host/wayland_window_unittest.cc ui/ozone/platform/wayland/host/wayland_window_unittest.cc
+index cca168290f53df2c415ca0368dcde9f6fb8476c6..9296d6fc2e9715515b9d2db792f75559f68bdd1d 100644
+--- ui/ozone/platform/wayland/host/wayland_window_unittest.cc
++++ ui/ozone/platform/wayland/host/wayland_window_unittest.cc
+@@ -7,6 +7,9 @@
+ 
+ #include <cursor-shape-v1-client-protocol.h>
+ #include <linux/input.h>
++#include <sys/socket.h>
++#include <wayland-client-core.h>
++#include <wayland-client-protocol.h>
+ #include <wayland-server-core.h>
+ #include <xdg-shell-server-protocol.h>
+ 
+@@ -4147,6 +4150,152 @@ TEST_P(WaylandWindowTest, InitialBounds) {
+   EXPECT_EQ(gfx::Rect(10, 10, 200, 200), toplevel->GetBoundsInDIP());
+ }
+ 
++TEST_P(WaylandWindowTest, EmbeddedResize) {
++  constexpr gfx::Rect kInitialBounds(800, 528);
++  constexpr gfx::Size kResizedSize(320, 240);
++  constexpr gfx::Point kSubsurfaceOffset(7, 72);
++
++  testing::NiceMock<MockWaylandPlatformWindowDelegate> embedded_delegate(
++      connection_.get());
++  ON_CALL(embedded_delegate, GetMinimumSizeForWindow())
++      .WillByDefault(Return(gfx::Size(1, 1)));
++
++  auto external_parent = connection_->CreateSurface();
++  ASSERT_TRUE(external_parent);
++  const uint32_t external_parent_id =
++      wl_proxy_get_id(reinterpret_cast<wl_proxy*>(external_parent.get()));
++
++  PlatformWindowInitProperties properties(kInitialBounds);
++  properties.type = PlatformWindowType::kWindow;
++  properties.parent_wayland_surface = external_parent.get();
++  properties.wayland_subsurface_offset = kSubsurfaceOffset;
++  auto embedded = embedded_delegate.CreateWaylandWindow(connection_.get(),
++                                                        std::move(properties));
++  ASSERT_TRUE(embedded);
++
++  const uint32_t embedded_surface_id =
++      embedded->root_surface()->get_surface_id();
++  embedded->Show(/*inactive=*/false);
++  connection_->Flush();
++
++  PostToServerAndWait([external_parent_id, embedded_surface_id,
++                       subsurface_offset = kSubsurfaceOffset](
++                          wl::TestWaylandServerThread* server) {
++    auto* external_parent =
++        server->GetObject<wl::MockSurface>(external_parent_id);
++    auto* embedded_surface =
++        server->GetObject<wl::MockSurface>(embedded_surface_id);
++    ASSERT_TRUE(external_parent);
++    ASSERT_TRUE(embedded_surface);
++    auto* subsurface = embedded_surface->sub_surface();
++    ASSERT_TRUE(subsurface);
++    EXPECT_EQ(external_parent->resource(), subsurface->parent_resource());
++    EXPECT_EQ(gfx::PointF(subsurface_offset), subsurface->position());
++
++    Mock::VerifyAndClearExpectations(external_parent);
++    Mock::VerifyAndClearExpectations(embedded_surface);
++    Mock::VerifyAndClearExpectations(subsurface);
++    EXPECT_CALL(*external_parent, Commit()).Times(0);
++    EXPECT_CALL(*subsurface, SetPosition(_, _)).Times(0);
++    EXPECT_CALL(*embedded_surface, Commit()).Times(1);
++  });
++
++  // Deliberately pass a non-zero origin to verify that embedded Widget/Aura
++  // bounds remain zero-origin. Runtime placement is stored independently in
++  // the wl_subsurface offset.
++  embedded->SetBoundsInDIP(gfx::Rect(gfx::Point(100, 200), kResizedSize));
++  EXPECT_EQ(gfx::Rect(kResizedSize), embedded->GetBoundsInDIP());
++
++  const gfx::Size resized_size_px = embedded->applied_state().size_px;
++  CreateBufferAndPresentAsNewFrame(embedded.get(), embedded_delegate,
++                                   resized_size_px,
++                                   embedded->applied_state().window_scale);
++
++  PostToServerAndWait([external_parent_id, embedded_surface_id,
++                       subsurface_offset = kSubsurfaceOffset](
++                          wl::TestWaylandServerThread* server) {
++    auto* external_parent =
++        server->GetObject<wl::MockSurface>(external_parent_id);
++    auto* embedded_surface =
++        server->GetObject<wl::MockSurface>(embedded_surface_id);
++    ASSERT_TRUE(external_parent);
++    ASSERT_TRUE(embedded_surface);
++    auto* subsurface = embedded_surface->sub_surface();
++    ASSERT_TRUE(subsurface);
++    EXPECT_EQ(gfx::PointF(subsurface_offset), subsurface->position());
++    Mock::VerifyAndClearExpectations(external_parent);
++    Mock::VerifyAndClearExpectations(embedded_surface);
++    Mock::VerifyAndClearExpectations(subsurface);
++  });
++
++  EXPECT_EQ(gfx::Rect(kResizedSize), embedded->latched_state().bounds_dip);
++  EXPECT_EQ(resized_size_px, embedded->latched_state().size_px);
++}
++
++TEST_P(WaylandWindowTest, EmbeddedRejectsInvalidParentSurface) {
++  EXPECT_FALSE(connection_->CanCreateSubsurface(nullptr));
++
++  int sockets[2];
++  ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets));
++  base::ScopedFD unused_server_socket(sockets[1]);
++  wl_display* foreign_display = wl_display_connect_to_fd(sockets[0]);
++  ASSERT_TRUE(foreign_display);
++  wl_proxy* foreign_surface = wl_proxy_create(
++      reinterpret_cast<wl_proxy*>(foreign_display), &wl_surface_interface);
++  ASSERT_TRUE(foreign_surface);
++
++  EXPECT_FALSE(connection_->CanCreateSubsurface(
++      reinterpret_cast<wl_surface*>(foreign_surface)));
++
++  PlatformWindowInitProperties properties(gfx::Rect(800, 528));
++  properties.type = PlatformWindowType::kWindow;
++  properties.parent_wayland_surface = foreign_surface;
++  EXPECT_FALSE(WaylandWindow::Create(&delegate_, connection_.get(),
++                                     std::move(properties)));
++
++  wl_proxy_destroy(foreign_surface);
++  wl_display_disconnect(foreign_display);
++}
++
++TEST_P(WaylandWindowTest, EmbeddedCloseIsIdempotent) {
++  testing::NiceMock<MockWaylandPlatformWindowDelegate> embedded_delegate(
++      connection_.get());
++  auto external_parent = connection_->CreateSurface();
++  ASSERT_TRUE(external_parent);
++
++  PlatformWindowInitProperties properties(gfx::Rect(800, 528));
++  properties.type = PlatformWindowType::kWindow;
++  properties.parent_wayland_surface = external_parent.get();
++  auto embedded = embedded_delegate.CreateWaylandWindow(connection_.get(),
++                                                        std::move(properties));
++  ASSERT_TRUE(embedded);
++
++  EXPECT_CALL(embedded_delegate, OnClosed()).Times(1);
++  embedded->Close();
++  embedded->Close();
++}
++
++class WaylandEmbeddedWindowNoSubcompositorTest : public WaylandTestSimple {
++ public:
++  WaylandEmbeddedWindowNoSubcompositorTest()
++      : WaylandTestSimple(wl::ServerConfig{.supports_subcompositor = false}) {
++    enabled_features_.clear();
++    disabled_features_.push_back(ui::kWaylandOverlayDelegation);
++  }
++};
++
++TEST_F(WaylandEmbeddedWindowNoSubcompositorTest, EmbeddedCreationFailsCleanly) {
++  auto external_parent = connection_->CreateSurface();
++  ASSERT_TRUE(external_parent);
++  EXPECT_FALSE(connection_->CanCreateSubsurface(external_parent.get()));
++
++  PlatformWindowInitProperties properties(gfx::Rect(800, 528));
++  properties.type = PlatformWindowType::kWindow;
++  properties.parent_wayland_surface = external_parent.get();
++  EXPECT_FALSE(WaylandWindow::Create(&delegate_, connection_.get(),
++                                     std::move(properties)));
++}
++
+ namespace {
+ 
+ class WaylandSubsurfaceTest : public WaylandWindowTest {
+diff --git ui/ozone/platform/wayland/ozone_platform_wayland.cc ui/ozone/platform/wayland/ozone_platform_wayland.cc
+index 39b1aa814c252a103f775898151feedffade5c3d..f0657e584e608d45e5bc6b6b73a3102bc92da290 100644
+--- ui/ozone/platform/wayland/ozone_platform_wayland.cc
++++ ui/ozone/platform/wayland/ozone_platform_wayland.cc
+@@ -147,6 +147,16 @@ class OzonePlatformWayland : public OzonePlatform,
+                                  std::move(properties));
+   }
+ 
++  bool CanUseExternalWaylandSurfaceForEmbedding(
++      wl_surface* surface) const override {
++    if (!connection_ || !connection_->uses_external_display()) {
++      LOG(ERROR) << "Wayland embedding requires an external wl_display passed "
++                    "to CefInitialize";
++      return false;
++    }
++    return connection_->CanCreateSubsurface(surface);
++  }
++
+   std::unique_ptr<display::NativeDisplayDelegate> CreateNativeDisplayDelegate()
+       override {
+     return nullptr;
+@@ -270,6 +280,14 @@ class OzonePlatformWayland : public OzonePlatform,
+     // event.
+     bool use_threaded_polling = args.single_process;
+ 
++    // If an embedder handed us its wl_display for window embedding (see
++    // OzonePlatform::SetExternalWaylandDisplayForEmbedding), adopt that
++    // connection instead of opening our own with wl_display_connect(nullptr).
++    // Ozone's dedicated event queue (created in WaylandConnection::Initialize)
++    // keeps us from consuming the embedder's events on the shared fd.
++    wl_display* external_display =
++        OzonePlatform::GetExternalWaylandDisplayForEmbedding();
++
+     base::ScopedFD drm_render_node_fd;
+ #if defined(WAYLAND_GBM)
+     DrmRenderNodeHandle drm_render_node;
+@@ -284,7 +302,7 @@ class OzonePlatformWayland : public OzonePlatform,
+       use_threaded_polling = drm_node_path.empty();
+     }
+ #endif
+-    if (!connection_->Initialize(use_threaded_polling)) {
++    if (!connection_->Initialize(use_threaded_polling, external_display)) {
+       LOG(ERROR) << "Failed to initialize Wayland platform";
+       return false;
+     }
+diff --git ui/ozone/platform/wayland/test/test_wayland_server_thread.cc ui/ozone/platform/wayland/test/test_wayland_server_thread.cc
+index bf63c21ecbb8008ada142821d41c3b480c92fc2e..2f02dfbb266aa837c714d39652279dbf82875870 100644
+--- ui/ozone/platform/wayland/test/test_wayland_server_thread.cc
++++ ui/ozone/platform/wayland/test/test_wayland_server_thread.cc
+@@ -106,8 +106,10 @@ bool TestWaylandServerThread::Start() {
+   if (!compositor_.Initialize(display_.get())) {
+     return false;
+   }
+-  if (!sub_compositor_.Initialize(display_.get()))
++  if (config_.supports_subcompositor &&
++      !sub_compositor_.Initialize(display_.get())) {
+     return false;
++  }
+   if (!viewporter_.Initialize(display_.get()))
+     return false;
+   if (!alpha_compositing_.Initialize(display_.get()))
+diff --git ui/ozone/platform/wayland/test/test_wayland_server_thread.h ui/ozone/platform/wayland/test/test_wayland_server_thread.h
+index ffb45991b6ad4e1918894140ecb2880d3ae43187..6a3e7de6599bdd540760bb39f855da4990cab245 100644
+--- ui/ozone/platform/wayland/test/test_wayland_server_thread.h
++++ ui/ozone/platform/wayland/test/test_wayland_server_thread.h
+@@ -62,6 +62,7 @@ struct ServerConfig {
+   ShouldUseLinuxDrmSyncobjProtocol use_linux_drm_syncobj =
+       ShouldUseLinuxDrmSyncobjProtocol::kNone;
+   bool supports_viewporter_surface_scaling = true;
++  bool supports_subcompositor = true;
+ };
+ 
+ class TestWaylandServerThread;
+diff --git ui/ozone/public/ozone_platform.cc ui/ozone/public/ozone_platform.cc
+index f73f654b81f2da2a978351b4f3694efa3bbeebcc..b71a1a634523098132b6d383f33dd0a7160c95a2 100644
+--- ui/ozone/public/ozone_platform.cc
++++ ui/ozone/public/ozone_platform.cc
+@@ -28,6 +28,10 @@ OzonePlatform* g_instance = nullptr;
+ 
+ bool g_fail_initialize_ui_for_test = false;
+ 
++// Browser-process only. Externally-owned wl_display provided by an embedder for
++// Wayland window embedding. See SetExternalWaylandDisplayForEmbedding().
++wl_display* g_external_wayland_display = nullptr;
++
+ void EnsureInstance() {
+   if (g_instance)
+     return;
+@@ -104,6 +108,21 @@ void OzonePlatform::InitializeForGPU(const InitParams& args) {
+   g_instance->InitializeGPU(args);
+ }
+ 
++// static
++void OzonePlatform::SetExternalWaylandDisplayForEmbedding(wl_display* display) {
++  g_external_wayland_display = display;
++}
++
++// static
++wl_display* OzonePlatform::GetExternalWaylandDisplayForEmbedding() {
++  return g_external_wayland_display;
++}
++
++bool OzonePlatform::CanUseExternalWaylandSurfaceForEmbedding(
++    wl_surface* surface) const {
++  return false;
++}
++
+ // static
+ OzonePlatform* OzonePlatform::GetInstance() {
+   DCHECK(g_instance) << "OzonePlatform is not initialized";
+diff --git ui/ozone/public/ozone_platform.h ui/ozone/public/ozone_platform.h
+index abee804e74da5b3d8b36ee900baa5fe08b96568b..526ca09ef3c640d29511a4259c477fbc2b54c88f 100644
+--- ui/ozone/public/ozone_platform.h
++++ ui/ozone/public/ozone_platform.h
+@@ -21,6 +21,11 @@
+ #include "ui/platform_window/platform_window.h"
+ #include "ui/platform_window/platform_window_delegate.h"
+ 
++// Forward declaration of the libwayland type, used by the Wayland-embedding
++// accessors below. Declared at global scope to match the C library type.
++struct wl_display;
++struct wl_surface;
++
+ namespace display {
+ class NativeDisplayDelegate;
+ }
+@@ -265,6 +270,23 @@ class COMPONENT_EXPORT(OZONE) OzonePlatform {
+   // provided by |args| as with InitalizeForUI.
+   static void InitializeForGPU(const InitParams& args);
+ 
++  // Browser-process only. An embedder that hosts Ozone/Wayland inside its own
++  // Wayland connection may call this before InitializeForUI() to hand the
++  // Wayland backend an existing wl_display. When set, the Wayland platform
++  // adopts this connection instead of calling wl_display_connect(nullptr). This
++  // has no effect on non-Wayland Ozone platforms. Ownership is retained by the
++  // caller, which must keep the display alive until after OzonePlatform
++  // shutdown. Must be called before InitializeForUI() to take effect.
++  static void SetExternalWaylandDisplayForEmbedding(wl_display* display);
++  static wl_display* GetExternalWaylandDisplayForEmbedding();
++
++  // Returns true if |surface| can be used as an external parent by the active
++  // Ozone platform. The Wayland implementation requires an embedder-provided
++  // display connection, a surface from that exact connection, and
++  // wl_subcompositor support. Other Ozone platforms return false.
++  virtual bool CanUseExternalWaylandSurfaceForEmbedding(
++      wl_surface* surface) const;
++
+   static OzonePlatform* GetInstance();
+ 
+   static bool IsInitialized();
+diff --git ui/platform_window/platform_window_init_properties.h ui/platform_window/platform_window_init_properties.h
+index fe72bc821b0f74f0eddd100e867e7f66b550b808..4ef04de2bf46770cca4436f487966b54fd4fb7d6 100644
+--- ui/platform_window/platform_window_init_properties.h
++++ ui/platform_window/platform_window_init_properties.h
+@@ -80,6 +80,15 @@ struct COMPONENT_EXPORT(PLATFORM_WINDOW) PlatformWindowInitProperties {
+   // Tells PlatformWindow which native widget its parent holds. It is usually
+   // used to find a parent from internal list of PlatformWindows.
+   gfx::AcceleratedWidget parent_widget = gfx::kNullAcceleratedWidget;
++  // CEF: when non-null on the Ozone/Wayland backend, the window roots itself as
++  // a wl_subsurface of this external wl_surface* (window embedding) instead of
++  // creating a toplevel. Opaque (void*) to avoid a wayland-client dependency in
++  // this cross-platform header. See OzonePlatform embedding accessors.
++  void* parent_wayland_surface = nullptr;
++  // CEF: offset (in DIP) of the embedded wl_subsurface within
++  // |parent_wayland_surface|. See Widget::InitParams::wayland_subsurface_offset
++  // and CEF issue #2804.
++  gfx::Point wayland_subsurface_offset;
+   // Tells the opacity type of a window. Check the comment in the
+   // Widget::InitProperties::WindowOpacity.
+   PlatformWindowOpacity opacity = PlatformWindowOpacity::kOpaqueWindow;

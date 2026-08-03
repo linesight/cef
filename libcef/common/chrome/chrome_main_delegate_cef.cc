@@ -39,6 +39,10 @@
 #include "ui/base/ui_base_paths.h"
 #include "ui/base/ui_base_switches.h"
 
+#if BUILDFLAG(IS_OZONE)
+#include "ui/ozone/public/ozone_platform.h"
+#endif
+
 #if BUILDFLAG(IS_MAC)
 #include "cef/libcef/common/util_mac.h"
 #elif BUILDFLAG(IS_POSIX)
@@ -173,6 +177,19 @@ std::optional<int> ChromeMainDelegateCef::BasicStartupComplete() {
   if (process_type.empty()) {
     // In the browser process. Populate the global command-line object.
     // TODO(chrome-runtime): Copy more settings from AlloyMainDelegate and test.
+
+#if BUILDFLAG(IS_OZONE) && CEF_API_ADDED(CEF_EXPERIMENTAL)
+    // Hand the Ozone/Wayland backend the embedder-provided wl_display so it can
+    // adopt that connection instead of opening its own (required for Wayland
+    // window embedding, see CefWindowInfo::parent_wayland_surface). Must run
+    // before Ozone UI initialization; this is a no-op on non-Wayland Ozone
+    // platforms and when no display is provided.
+    if (settings_->wayland_display) {
+      ui::OzonePlatform::SetExternalWaylandDisplayForEmbedding(
+          settings_->wayland_display);
+    }
+#endif
+
     if (settings_->command_line_args_disabled) {
       // Remove any existing command-line arguments.
       base::CommandLine::StringVector argv;

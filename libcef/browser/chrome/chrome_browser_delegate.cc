@@ -146,8 +146,11 @@ Browser* ChromeBrowserDelegate::CreateDevToolsBrowser(
   } else if (opener_browser_host->platform_delegate()->HasExternalParent()) {
     // A parent window handle for DevTools creation is only supported if the
     // opener also has an external parent.
-    create_params.MaybeSetWindowInfo(window_info, /*allow_alloy_style=*/false,
-                                     /*allow_chrome_style=*/true);
+    if (!create_params.MaybeSetWindowInfo(window_info,
+                                          /*allow_alloy_style=*/false,
+                                          /*allow_chrome_style=*/true)) {
+      return nullptr;
+    }
   } else if (chrome_child_window::HasParentHandle(window_info)) {
     LOG(ERROR) << "Parent window handle not supported for this DevTools window";
   }

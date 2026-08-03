@@ -304,24 +304,30 @@ void CefWindowX11::SetBounds(const gfx::Rect& bounds) {
     return;
   }
 
-  x11::ConfigureWindowRequest req{.window = xwindow_};
+  // ConfigureNotify is asynchronous, so |bounds_| may lag behind multiple
+  // host-driven resize requests. Send every field to make this request
+  // authoritative; comparing against stale confirmed bounds can otherwise
+  // drop a final request or preserve an intermediate origin.
+  connection_->ConfigureWindow({
+      .window = xwindow_,
+      .x = bounds.x(),
+      .y = bounds.y(),
+      .width = bounds.width(),
+      .height = bounds.height(),
+  });
+}
 
-  bool origin_changed = bounds_.origin() != bounds.origin();
-  bool size_changed = bounds_.size() != bounds.size();
-
-  if (size_changed) {
-    req.width = bounds.width();
-    req.height = bounds.height();
+void CefWindowX11::SetSize(const gfx::Size& size) {
+  if (xwindow_ == x11::Window::None) {
+    return;
   }
 
-  if (origin_changed) {
-    req.x = bounds.x();
-    req.y = bounds.y();
-  }
-
-  if (origin_changed || size_changed) {
-    connection_->ConfigureWindow(req);
-  }
+  // SizeTo() is content-driven and must not reposition the native window.
+  connection_->ConfigureWindow({
+      .window = xwindow_,
+      .width = size.width(),
+      .height = size.height(),
+  });
 }
 
 gfx::Rect CefWindowX11::GetBoundsInScreen() {

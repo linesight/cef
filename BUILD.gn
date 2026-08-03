@@ -409,6 +409,8 @@ if (is_win) {
 # that is limited in scope (e.g. utility classes/methods).
 source_set("libcef_static_unittested") {
   sources = [
+    "libcef/browser/browser_host_create_util.cc",
+    "libcef/browser/browser_host_create_util.h",
     "libcef/browser/devtools/devtools_util.cc",
     "libcef/browser/devtools/devtools_util.h",
     "libcef/browser/geometry_util.h",
@@ -436,6 +438,7 @@ test("libcef_static_unittests") {
   testonly = true
 
   sources = [
+    "libcef/browser/browser_host_create_util_unittest.cc",
     "libcef/browser/devtools/devtools_util_unittest.cc",
     "libcef/browser/geometry_util_unittest.cc",
   ]

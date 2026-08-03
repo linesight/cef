@@ -12,6 +12,7 @@
 #include "ui/views/controls/webview/webview.h"
 #include "ui/views/layout/fill_layout.h"
 #include "ui/views/widget/widget.h"
+#include "ui/views/window/native_frame_view.h"
 
 // Owned by the Widget, via CefNativeWidgetDelegate.
 class CefNativeContentsView : public views::View {
@@ -61,6 +62,7 @@ CefNativeWidgetDelegate::CefNativeWidgetDelegate(
       on_delete_(std::move(on_delete)) {}
 
 void CefNativeWidgetDelegate::Init(gfx::AcceleratedWidget parent_widget,
+                                   void* parent_wayland_surface,
                                    content::WebContents* web_contents,
                                    const gfx::Rect& bounds) {
   DCHECK(!contents_view_);
@@ -80,13 +82,34 @@ void CefNativeWidgetDelegate::Init(gfx::AcceleratedWidget parent_widget,
   // Windows style flags.
   views::Widget::InitParams params(
       views::Widget::InitParams::CLIENT_OWNS_WIDGET);
-  params.parent_widget = parent_widget;
   params.bounds = bounds;
   params.delegate = this;
-  // Set the WS_CHILD flag.
-  params.child = true;
-  // Set the WS_VISIBLE flag.
-  params.type = views::Widget::InitParams::TYPE_CONTROL;
+  if (parent_wayland_surface) {
+    // Ozone/Wayland embedding (CEF issue #2804): there is no intermediate
+    // CEF-owned window as on X11. This widget is a top-level desktop widget
+    // whose WaylandWindow roots itself as a wl_subsurface of the external
+    // |parent_wayland_surface|. TYPE_WINDOW maps to
+    // PlatformWindowType::kWindow, which the Wayland window factory routes to a
+    // WaylandEmbeddedWindow when |parent_wayland_surface| is set.
+    params.parent_wayland_surface = parent_wayland_surface;
+    // The wl_subsurface has no OS window decorations; suppress the Views window
+    // frame (see CreateFrameView) so the web contents fill it. CEF #2804.
+    frameless_ = true;
+    // |bounds| carries the browser's position within the host's content area in
+    // its origin, but the widget itself must stay zero-origin (a non-zero
+    // origin marks it off-root and occlusion tracking stops frame production).
+    // Carry the origin separately as the subsurface offset. See CEF #2804.
+    params.wayland_subsurface_offset = bounds.origin();
+    params.bounds = gfx::Rect(gfx::Point(), bounds.size());
+    params.child = false;
+    params.type = views::Widget::InitParams::TYPE_WINDOW;
+  } else {
+    params.parent_widget = parent_widget;
+    // Set the WS_CHILD flag.
+    params.child = true;
+    // Set the WS_VISIBLE flag.
+    params.type = views::Widget::InitParams::TYPE_CONTROL;
+  }
   // Don't set the WS_EX_COMPOSITED flag.
   params.opacity = views::Widget::InitParams::WindowOpacity::kOpaque;
   // Tell Aura not to draw the window frame on resize.
@@ -121,4 +144,27 @@ void CefNativeWidgetDelegate::WidgetIsZombie(views::Widget* widget) {
   }
 
   delete this;
+}
+
+bool CefNativeWidgetDelegate::MaybeGetMinimumSize(gfx::Size* size) const {
+  if (!frameless_) {
+    return false;
+  }
+
+  // The embedded Wayland Widget is a resizable wl_subsurface, not a desktop
+  // toplevel. The default Views minimum derives from the mutable WebView
+  // preferred size and can clamp subsequent host-driven shrinks.
+  *size = gfx::Size(1, 1);
+  return true;
+}
+
+std::unique_ptr<views::FrameView> CefNativeWidgetDelegate::CreateFrameView(
+    views::Widget* widget) {
+  if (frameless_) {
+    // NativeFrameView draws no client-side chrome and gives the client view the
+    // full window bounds -- the web contents fill the wl_subsurface with no
+    // title bar/caption. See CEF issue #2804.
+    return std::make_unique<views::NativeFrameView>(widget);
+  }
+  return nullptr;
 }

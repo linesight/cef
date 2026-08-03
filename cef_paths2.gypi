@@ -759,6 +759,7 @@
     ],
     'ceftests_sources_linux': [
       'tests/ceftests/resource_util_linux.cc',
+      'tests/ceftests/window_info_unittest.cc',
     ],
   },
 }

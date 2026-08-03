@@ -74,6 +74,21 @@ void ClientAppBrowser::OnBeforeCommandLineProcessing(
 #endif
 
 #if defined(OS_LINUX)
+    // The experimental native Wayland embedding harness requires Chromium's
+    // Wayland Ozone backend. This browser-process switch is propagated to
+    // child processes by Chromium.
+    if (command_line->HasSwitch(switches::kWaylandEmbed) &&
+        !command_line->HasSwitch(switches::kOzonePlatform)) {
+      command_line->AppendSwitchWithValue(switches::kOzonePlatform, "wayland");
+    }
+    // cefclient's host window is GTK. Force Chromium to initialize the same UI
+    // toolkit so the early checked GDK initialization is followed by GTK
+    // initialization during CefInitialize().
+    if (command_line->HasSwitch(switches::kWaylandEmbed) &&
+        !command_line->HasSwitch("ui-toolkit")) {
+      command_line->AppendSwitchWithValue("ui-toolkit", "gtk");
+    }
+
     // On Linux, in off screen rendering (OSR) shared texture mode, we must
     // ensure that ANGLE uses the EGL backend. Without this, DMABUF based
     // rendering will fail. The Chromium fallback path uses X11 pixmaps,

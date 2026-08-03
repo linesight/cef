@@ -38,6 +38,10 @@
 #define CefCursorHandle cef_cursor_handle_t
 #define CefEventHandle cef_event_handle_t
 #define CefWindowHandle cef_window_handle_t
+#if CEF_API_ADDED(CEF_EXPERIMENTAL)
+#define CefWaylandSurfaceHandle cef_wayland_surface_handle_t
+#define CefWaylandDisplayHandle cef_wayland_display_handle_t
+#endif
 
 ///
 /// Class representing CefExecuteProcess arguments.
@@ -71,6 +75,12 @@ struct CefWindowInfoTraits {
     target->external_begin_frame_enabled = src->external_begin_frame_enabled;
     target->window = src->window;
     target->runtime_style = src->runtime_style;
+
+#if CEF_API_ADDED(CEF_EXPERIMENTAL)
+    if (CEF_MEMBER_EXISTS(src, parent_wayland_surface)) {
+      target->parent_wayland_surface = src->parent_wayland_surface;
+    }
+#endif
   }
 };
 
@@ -108,6 +118,28 @@ class CefWindowInfo : public CefStructBase<CefWindowInfoTraits> {
     parent_window = parent;
     runtime_style = CEF_RUNTIME_STYLE_ALLOY;
   }
+
+#if CEF_API_ADDED(CEF_EXPERIMENTAL)
+  ///
+  /// Create the browser as a child of the Wayland |parent| surface
+  /// (wl_surface*) when running with the Ozone/Wayland backend. The parent
+  /// surface must share the wl_display connection provided via
+  /// CefSettings.wayland_display, and |bounds| are logical pixels (DIP)
+  /// relative to the parent surface. This method selects Alloy runtime style,
+  /// which is currently required for Wayland child browsers.
+  ///
+  /// CEF does not own the parent surface and will not commit it. See
+  /// cef_window_info_t::parent_wayland_surface for the complete ownership,
+  /// lifetime, parent-commit and input limitations. On the X11 backend use
+  /// SetAsChild() instead.
+  ///
+  void SetAsWaylandChild(CefWaylandSurfaceHandle parent,
+                         const CefRect& bounds) {
+    parent_wayland_surface = parent;
+    this->bounds = bounds;
+    runtime_style = CEF_RUNTIME_STYLE_ALLOY;
+  }
+#endif
 };
 
 #endif  // CEF_INCLUDE_INTERNAL_CEF_LINUX_H_

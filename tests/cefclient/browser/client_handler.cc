@@ -1001,6 +1001,19 @@ bool ClientHandler::OnBeforePopup(
     bool* no_javascript_access) {
   CEF_REQUIRE_UI_THREAD();
 
+#if defined(OS_LINUX)
+  if (MainContext::Get()->GetCommandLine()->HasSwitch(
+          switches::kWaylandEmbed)) {
+    // Native cefclient popups are initially attached to a temporary X11 window
+    // and later reparented. Wayland has no equivalent reparenting operation.
+    // This also blocks document picture-in-picture, which arrives through the
+    // same popup callback.
+    LOG(WARNING) << "--wayland-embed: popup creation is disabled; the "
+                    "cefclient popup path requires X11 reparenting";
+    return true;
+  }
+#endif
+
   if (target_disposition == CEF_WOD_NEW_PICTURE_IN_PICTURE) {
     // Use default handling for document picture-in-picture popups.
     client = nullptr;
@@ -1285,6 +1298,15 @@ void ClientHandler::ShowDevTools(CefRefPtr<CefBrowser> browser,
                                        browser, inspect_element_at));
     return;
   }
+
+#if defined(OS_LINUX)
+  if (MainContext::Get()->GetCommandLine()->HasSwitch(
+          switches::kWaylandEmbed)) {
+    LOG(WARNING) << "--wayland-embed: DevTools popup creation is disabled; "
+                    "the cefclient popup path requires X11 reparenting";
+    return;
+  }
+#endif
 
   CefWindowInfo windowInfo;
   CefRefPtr<CefClient> client;

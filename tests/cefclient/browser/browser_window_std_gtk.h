@@ -28,6 +28,7 @@ class BrowserWindowStdGtk : public BrowserWindow {
   void set_xdisplay(XDisplay* xdisplay);
 
   // BrowserWindow methods.
+  void OnBrowserCreated(CefRefPtr<CefBrowser> browser) override;
   void CreateBrowser(ClientWindowHandle parent_handle,
                      const CefRect& rect,
                      const CefBrowserSettings& settings,
@@ -50,6 +51,13 @@ class BrowserWindowStdGtk : public BrowserWindow {
 
  private:
   XDisplay* xdisplay_;
+
+  // On the Wayland embedding path (#2804), the GTK widget whose wl_surface is
+  // the parent of the browser's wl_subsurface. libcef does not commit that
+  // (embedder-owned) surface, so we invalidate this widget's GDK window once
+  // the browser is created to make GTK commit it and latch the subsurface. Null
+  // on X11.
+  ClientWindowHandle wayland_parent_ = nullptr;
 };
 
 }  // namespace client

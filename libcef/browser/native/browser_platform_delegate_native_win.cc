@@ -10,6 +10,7 @@
 
 #include "base/base_paths_win.h"
 #include "base/files/file_util.h"
+#include "base/logging.h"
 #include "base/path_service.h"
 #include "base/strings/utf_string_conversions.h"
 #include "base/task/current_thread.h"
@@ -220,7 +221,8 @@ bool CefBrowserPlatformDelegateNativeWin::CreateHostWindow() {
   auto* widget_delegate = new CefNativeWidgetDelegate(
       GetBackgroundColor(), always_on_top, GetBoundsChangedCallback(),
       GetWidgetDeleteCallback());
-  widget_delegate->Init(window_info_.window, web_contents_,
+  widget_delegate->Init(window_info_.window, /*parent_wayland_surface=*/nullptr,
+                        web_contents_,
                         gfx::Rect(0, 0, dip_rect.width(), dip_rect.height()));
 
   window_widget_ = widget_delegate->GetWidget();
@@ -355,6 +357,37 @@ void CefBrowserPlatformDelegateNativeWin::NotifyMoveOrResizeStarted() {
     // Cast to HWNDMessageHandlerDelegate so we can access HandleMove().
     static_cast<views::HWNDMessageHandlerDelegate*>(tree_host)->HandleMove();
   }
+}
+
+void CefBrowserPlatformDelegateNativeWin::SetBounds(const gfx::Rect& bounds) {
+  HWND window = window_info_.window;
+  if (!window) {
+    return;
+  }
+  if (!(GetWindowLong(window, GWL_STYLE) & WS_CHILD)) {
+    LOG(WARNING) << "CefBrowserHost::SetBounds requires an externally parented "
+                    "Windows child window";
+    return;
+  }
+
+  RECT current_rect;
+  const bool size_changed =
+      !GetWindowRect(window, &current_rect) ||
+      current_rect.right - current_rect.left != bounds.width() ||
+      current_rect.bottom - current_rect.top != bounds.height();
+
+  if (!SetWindowPos(window, nullptr, bounds.x(), bounds.y(), bounds.width(),
+                    bounds.height(), SWP_NOZORDER | SWP_NOACTIVATE)) {
+    return;
+  }
+
+  // WM_MOVE already drives this notification for position-only changes, but
+  // the WM_SIZE handler only resizes the inner Widget.
+  if (size_changed) {
+    NotifyMoveOrResizeStarted();
+  }
+  window_info_.bounds =
+      CefRect(bounds.x(), bounds.y(), bounds.width(), bounds.height());
 }
 
 void CefBrowserPlatformDelegateNativeWin::SizeTo(int width, int height) {

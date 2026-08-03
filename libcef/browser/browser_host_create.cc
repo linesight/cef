@@ -5,12 +5,38 @@
 
 #include "cef/include/cef_browser.h"
 #include "cef/libcef/browser/alloy/alloy_browser_host_impl.h"
+#include "cef/libcef/browser/browser_host_create_util.h"
 #include "cef/libcef/browser/chrome/chrome_browser_host_impl.h"
 #include "cef/libcef/browser/chrome/views/chrome_child_window.h"
 #include "cef/libcef/browser/context.h"
 #include "cef/libcef/browser/thread_util.h"
 
+#if BUILDFLAG(IS_LINUX)
+#include "ui/ozone/public/ozone_platform.h"
+#endif
+
 namespace {
+
+bool IsWaylandChild(const CefWindowInfo& window_info) {
+#if BUILDFLAG(IS_LINUX) && CEF_API_ADDED(CEF_EXPERIMENTAL)
+  return browser_host_create_util::IsWaylandChild(
+      ui::OzonePlatform::GetPlatformNameForTest() == "wayland",
+      window_info.windowless_rendering_enabled,
+      CEF_MEMBER_EXISTS(&window_info, parent_wayland_surface) &&
+          window_info.parent_wayland_surface != nullptr);
+#else
+  return false;
+#endif
+}
+
+bool ValidateWindowInfo(const CefWindowInfo& window_info) {
+  if (!browser_host_create_util::IsValidRuntimeStyle(
+          IsWaylandChild(window_info), window_info.runtime_style)) {
+    LOG(ERROR) << "Wayland child browsers require Alloy runtime style";
+    return false;
+  }
+  return true;
+}
 
 class CreateBrowserHelper {
  public:
@@ -59,6 +85,10 @@ bool CefBrowserHost::CreateBrowser(
   // Verify that the settings structure is a valid size.
   if (!CEF_MEMBER_EXISTS(&settings, chrome_zoom_bubble)) {
     DCHECK(false) << "invalid CefBrowserSettings structure size";
+    return false;
+  }
+
+  if (!ValidateWindowInfo(windowInfo)) {
     return false;
   }
 
@@ -120,6 +150,10 @@ CefRefPtr<CefBrowser> CefBrowserHost::CreateBrowserSync(
     return nullptr;
   }
 
+  if (!ValidateWindowInfo(windowInfo)) {
+    return nullptr;
+  }
+
   if (!request_context) {
     request_context = CefRequestContext::GetGlobalContext();
   }
@@ -140,8 +174,11 @@ CefRefPtr<CefBrowser> CefBrowserHost::CreateBrowserSync(
   }
 
   CefBrowserCreateParams create_params;
-  create_params.MaybeSetWindowInfo(windowInfo, /*allow_alloy_style=*/true,
-                                   /*allow_chrome_style=*/true);
+  if (!create_params.MaybeSetWindowInfo(windowInfo,
+                                        /*allow_alloy_style=*/true,
+                                        /*allow_chrome_style=*/true)) {
+    return nullptr;
+  }
   create_params.client = client;
   create_params.url = url;
   create_params.settings = settings;
@@ -219,10 +256,19 @@ void CefBrowserCreateParams::InitWindowInfo(CefWindowInfo* window_info,
   }
 }
 
-void CefBrowserCreateParams::MaybeSetWindowInfo(
+bool CefBrowserCreateParams::MaybeSetWindowInfo(
     const CefWindowInfo& new_window_info,
     bool allow_alloy_style,
     bool allow_chrome_style) {
+  if (!ValidateWindowInfo(new_window_info)) {
+    return false;
+  }
+
+  if (IsWaylandChild(new_window_info) && !allow_alloy_style) {
+    LOG(ERROR) << "Wayland child embedding is not supported for this browser";
+    return false;
+  }
+
   if (allow_chrome_style && new_window_info.windowless_rendering_enabled) {
     // Chrome style is not supported with windowles rendering.
     allow_chrome_style = false;
@@ -263,6 +309,8 @@ void CefBrowserCreateParams::MaybeSetWindowInfo(
       window_info->runtime_style = CEF_RUNTIME_STYLE_DEFAULT;
     }
   }
+
+  return true;
 }
 
 // static

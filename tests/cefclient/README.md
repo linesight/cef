@@ -102,6 +102,47 @@ cefclient uses the Chrome bootstrap and supports two browser styles:
 
 Use command-line flags to select the browser style and other options.
 
+## Experimental Wayland Embedding (Linux)
+
+cefclient includes an experimental GTK harness for rendering a native,
+windowed Alloy browser as a Wayland subsurface. Run it from a native Wayland
+session with:
+
+```bash
+cefclient --wayland-embed --use-native --use-alloy-style --no-sandbox
+```
+
+The `--no-sandbox` flag may be omitted when cefclient was built without sandbox
+support. The harness requires the standard single-threaded message loop and
+cannot be combined with Views, off-screen rendering,
+`--multi-threaded-message-loop`, or `--external-message-pump`.
+`--ozone-platform=wayland` and `--ui-toolkit=gtk` are selected automatically;
+conflicting explicit values are rejected.
+
+GDK owns the shared `wl_display*` and parent `wl_surface*`. cefclient keeps the
+display alive until `CefShutdown()` returns and keeps each parent surface alive
+through the browser's `OnBeforeClose()` callback. CEF does not own either
+handle and never commits the parent surface. After browser creation, cefclient
+invalidates the parent GDK window so that GTK performs the commit needed to
+latch the initial subsurface attach and position.
+
+The client and CEF use separate event queues on one display connection. This
+shared-reader behavior is experimental; do not issue concurrent display reads
+or round trips from another thread while CEF is using the connection.
+
+Current limitations:
+
+- The harness demonstrates rendering and resize only. The child has an empty
+  input region, and mouse/scroll, keyboard/focus, touch, IME, and drag-and-drop
+  input are not forwarded to the browser.
+- Popups, document picture-in-picture, and DevTools are disabled.
+- Wayland bounds are parent-relative logical pixels (DIP). Runtime width and
+  height changes are supported, but x/y must remain equal to the initial
+  values passed to `SetAsWaylandChild()`.
+- Browser creation is asynchronous. A failure after the request is accepted
+  has no cefclient callback and may leave the already-created GTK host window
+  blank; inspect the process log for the failure.
+
 ## Exploring Features
 
 Try these different modes to explore various cefclient features:

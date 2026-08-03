@@ -474,6 +474,12 @@ struct CefSettingsTraits {
       target->use_views_default_popup = src->use_views_default_popup;
     }
 #endif
+
+#if CEF_API_ADDED(CEF_EXPERIMENTAL) && defined(OS_LINUX)
+    if (CEF_MEMBER_EXISTS(src, wayland_display)) {
+      target->wayland_display = src->wayland_display;
+    }
+#endif
   }
 };
 

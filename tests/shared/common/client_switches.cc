@@ -65,6 +65,7 @@ const char kUseChromeStyleWindow[] = "use-chrome-style-window";
 const char kShowOverlayBrowser[] = "show-overlay-browser";
 const char kUseAngle[] = "use-angle";
 const char kOzonePlatform[] = "ozone-platform";
+const char kWaylandEmbed[] = "wayland-embed";
 const char kAxViewportCollapse[] = "ax-viewport-collapse";
 
 }  // namespace client::switches

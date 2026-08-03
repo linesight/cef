@@ -45,8 +45,9 @@ struct CefBrowserCreateParams {
     request_context = that.request_context;
     extra_info = that.extra_info;
     if (that.window_info) {
-      MaybeSetWindowInfo(*that.window_info, /*allow_alloy_style=*/false,
-                         /*allow_chrome_style=*/true);
+      CHECK(MaybeSetWindowInfo(*that.window_info,
+                               /*allow_alloy_style=*/false,
+                               /*allow_chrome_style=*/true));
     }
     browser_view = that.browser_view;
     return *this;
@@ -57,8 +58,9 @@ struct CefBrowserCreateParams {
   static void InitWindowInfo(CefWindowInfo* window_info,
                              CefBrowserHostBase* opener);
 
-  // Set |window_info| if appropriate (see below).
-  void MaybeSetWindowInfo(const CefWindowInfo& window_info,
+  // Set |window_info| if appropriate (see below). Returns false if the
+  // requested configuration is invalid.
+  bool MaybeSetWindowInfo(const CefWindowInfo& window_info,
                           bool allow_alloy_style,
                           bool allow_chrome_style);
 
@@ -280,6 +282,7 @@ class CefBrowserHostBase : public CefBrowserHost,
   bool IsRenderProcessUnresponsive() override;
   cef_runtime_style_t GetRuntimeStyle() override;
   void SetAxViewportCollapse(bool enabled) override;
+  void SetBounds(const CefRect& bounds) override;
 
   // CefBrowser methods:
   bool IsValid() override;

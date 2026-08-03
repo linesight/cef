@@ -37,6 +37,7 @@
 
 #if defined(OS_LINUX)
 
+#include "include/cef_api_hash.h"
 #include "include/internal/cef_export.h"
 #include "include/internal/cef_string.h"
 #include "include/internal/cef_types_color.h"
@@ -65,6 +66,21 @@ typedef void* cef_event_handle_t;
 #endif
 
 typedef unsigned long cef_window_handle_t;
+
+#if CEF_API_ADDED(CEF_EXPERIMENTAL)
+///
+/// Handle types for Ozone/Wayland embedding, used by
+/// cef_window_info_t::parent_wayland_surface and
+/// cef_settings_t::wayland_display.
+/// These are opaque pointers to libwayland-client objects (wl_surface*,
+/// wl_display*). Forward-declared struct tags are used so that clients that do
+/// not use Wayland embedding are not required to include the wayland-client
+/// headers; the tags are layout-compatible with the libwayland definitions for
+/// clients that do include them.
+///
+typedef struct wl_surface* cef_wayland_surface_handle_t;
+typedef struct wl_display* cef_wayland_display_handle_t;
+#endif
 
 ///
 /// Return the singleton X11 display shared with Chromium. The display is not
@@ -149,6 +165,32 @@ typedef struct _cef_window_info_t {
   /// documentation for details.
   ///
   cef_runtime_style_t runtime_style;
+
+#if CEF_API_ADDED(CEF_EXPERIMENTAL)
+  ///
+  /// Parent Wayland surface (wl_surface*) to embed the browser into when
+  /// running with the Ozone/Wayland backend. When set, the browser window is
+  /// created as a wl_subsurface of this surface. This is only supported for
+  /// native-hosted (non-Views), windowed, externally parented Alloy browsers.
+  /// The initial |bounds| are logical pixels (DIP) relative to this surface.
+  ///
+  /// The parent surface must have been created from the exact wl_display
+  /// connection provided via CefSettings.wayland_display. CEF does not own or
+  /// destroy the parent surface. The client must keep it valid through the
+  /// browser's CefLifeSpanHandler::OnBeforeClose() callback; destroying it
+  /// earlier violates this contract.
+  ///
+  /// CEF never commits the parent surface. The client or host toolkit must
+  /// arrange a parent commit after browser creation succeeds so the initial
+  /// subsurface attach and position take effect. Direct Wayland input delivery
+  /// to the embedded browser is not currently supported.
+  ///
+  /// Alloy runtime style must be selected explicitly when setting this field
+  /// directly (for example, via the C API). Has no effect on the X11 backend,
+  /// where |parent_window| is used instead.
+  ///
+  cef_wayland_surface_handle_t parent_wayland_surface;
+#endif
 } cef_window_info_t;
 
 ///

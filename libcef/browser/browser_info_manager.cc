@@ -135,6 +135,7 @@ bool CefBrowserInfoManager::CanCreateWindow(
 
   CefWindowInfo window_info;
   CefBrowserCreateParams::InitWindowInfo(&window_info, browser.get());
+  CefWindowInfo unmodified_window_info;
 
   auto pending_popup = std::make_unique<CefBrowserInfoManager::PendingPopup>();
   pending_popup->step = PendingPopup::CAN_CREATE_WINDOW;
@@ -176,6 +177,11 @@ bool CefBrowserInfoManager::CanCreateWindow(
 
       const int popup_id = browser->GetNextPopupId();
 
+      // WindowInfo changes made by the callback are ignored for Views-hosted
+      // popups. Preserve the pre-callback value so ignored changes are not
+      // validated as if they described a native child.
+      unmodified_window_info = window_info;
+
       allow = !handler->OnBeforePopup(
           browser.get(), opener_frame, popup_id,
           pending_popup->target_url.spec(), pending_popup->target_frame_name,
@@ -207,10 +213,6 @@ bool CefBrowserInfoManager::CanCreateWindow(
   }
 
   if (allow) {
-    CefBrowserCreateParams create_params;
-    create_params.MaybeSetWindowInfo(window_info, /*allow_alloy_style=*/true,
-                                     /*allow_chrome_style=*/true);
-
     if (!handled) {
       // Use default Browser creation with Chrome style if OnBeforePopup was
       // unhandled.
@@ -219,8 +221,22 @@ bool CefBrowserInfoManager::CanCreateWindow(
       pending_popup->use_default_browser_creation = true;
     }
 
+    CefBrowserCreateParams create_params;
     create_params.popup_with_views_hosted_opener = ShouldCreateViewsHostedPopup(
         browser, pending_popup->use_default_browser_creation);
+
+    const CefWindowInfo& effective_window_info =
+        create_params.popup_with_views_hosted_opener && handled
+            ? unmodified_window_info
+            : window_info;
+    if (!create_params.MaybeSetWindowInfo(effective_window_info,
+                                          /*allow_alloy_style=*/true,
+                                          /*allow_chrome_style=*/true)) {
+      if (pending_popup->aborted_callback) {
+        std::move(pending_popup->aborted_callback).Run();
+      }
+      return false;
+    }
 
     // Potentially use Alloy style.
     create_params.popup_with_alloy_style_opener = browser->IsAlloyStyle();

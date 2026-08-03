@@ -4,7 +4,10 @@
 
 #include "cef/libcef/browser/native/browser_platform_delegate_native_linux.h"
 
+#include "base/functional/bind.h"
+#include "base/logging.h"
 #include "base/no_destructor.h"
+#include "cef/libcef/browser/alloy/alloy_browser_host_impl.h"
 #include "cef/libcef/browser/browser_host_base.h"
 #include "cef/libcef/browser/context.h"
 #include "cef/libcef/browser/native/native_widget_delegate.h"
@@ -24,6 +27,10 @@
 #include "ui/events/keycodes/keyboard_code_conversion_x.h"
 #include "ui/events/keycodes/keyboard_code_conversion_xkb.h"
 #include "ui/views/widget/desktop_aura/desktop_window_tree_host_linux.h"
+#endif
+
+#if BUILDFLAG(SUPPORTS_OZONE_WAYLAND)
+#include "ui/ozone/public/ozone_platform.h"
 #endif
 
 CefBrowserPlatformDelegateNativeLinux::CefBrowserPlatformDelegateNativeLinux(
@@ -54,39 +61,90 @@ bool CefBrowserPlatformDelegateNativeLinux::CreateHostWindow() {
   gfx::Rect rect(window_info_.bounds.x, window_info_.bounds.y,
                  window_info_.bounds.width, window_info_.bounds.height);
 
-#if BUILDFLAG(SUPPORTS_OZONE_X11)
-  DCHECK(!window_x11_);
+#if BUILDFLAG(SUPPORTS_OZONE_WAYLAND)
+  if (!host_window_created_ &&
+      ui::OzonePlatform::GetPlatformNameForTest() == "wayland") {
+    // Ozone/Wayland embedding (CEF issue #2804). Unlike X11, no intermediate
+    // CEF-owned window is created: the browser's own WaylandWindow roots itself
+    // as a wl_subsurface of the external parent surface (provided in
+    // CefWindowInfo). Wayland has no server-global window-handle equivalent to
+    // an X11 XID, so |window| is left null.
+    void* parent_wayland_surface = nullptr;
+#if CEF_API_ADDED(CEF_EXPERIMENTAL)
+    parent_wayland_surface = window_info_.parent_wayland_surface;
+#endif
+    if (!parent_wayland_surface) {
+      LOG(ERROR) << "Native Ozone/Wayland browser creation requires an "
+                    "external parent wl_surface";
+      return false;
+    }
+    if (!ui::OzonePlatform::GetInstance()
+             ->CanUseExternalWaylandSurfaceForEmbedding(
+                 static_cast<wl_surface*>(parent_wayland_surface))) {
+      return false;
+    }
+    window_info_.window = kNullWindowHandle;
 
-  x11::Window parent_window = x11::Window::None;
-  if (window_info_.parent_window != kNullWindowHandle) {
-    parent_window = static_cast<x11::Window>(window_info_.parent_window);
+    host_window_created_ = true;
+
+    // Add a reference that will be released in BrowserDestroyed().
+    browser_->AddRef();
+
+    auto* widget_delegate = new CefNativeWidgetDelegate(
+        GetBackgroundColor(), /*always_on_top=*/false,
+        GetBoundsChangedCallback(),
+        base::BindOnce(
+            &CefBrowserPlatformDelegateNativeLinux::WaylandWidgetDeleted,
+            weak_ptr_factory_.GetWeakPtr()));
+    // Pass the full |rect|: its size sizes the widget while its origin (the
+    // browser's position within the host's content area, e.g. below the host's
+    // menu/tool bars) becomes the wl_subsurface offset. The widget's own bounds
+    // are kept zero-origin inside Init() -- a non-zero widget origin marks it
+    // off-root and occlusion tracking stops frame production (CEF #2804).
+    widget_delegate->Init(gfx::kNullAcceleratedWidget, parent_wayland_surface,
+                          web_contents_, rect);
+
+    window_widget_ = widget_delegate->GetWidget();
+    window_widget_->Show();
   }
+#endif  // BUILDFLAG(SUPPORTS_OZONE_WAYLAND)
 
-  // Create a new window object. It will delete itself when the associated X11
-  // window is destroyed.
-  window_x11_ =
-      new CefWindowX11(browser_.get(), parent_window, rect,
-                       CefString(&window_info_.window_name).ToString());
-  DCHECK_NE(window_x11_->xwindow(), x11::Window::None);
-  window_info_.window =
-      static_cast<cef_window_handle_t>(window_x11_->xwindow());
+#if BUILDFLAG(SUPPORTS_OZONE_X11)
+  if (!host_window_created_) {
+    DCHECK(!window_x11_);
 
-  host_window_created_ = true;
+    x11::Window parent_window = x11::Window::None;
+    if (window_info_.parent_window != kNullWindowHandle) {
+      parent_window = static_cast<x11::Window>(window_info_.parent_window);
+    }
 
-  // Add a reference that will be released in BrowserDestroyed().
-  browser_->AddRef();
+    // Create a new window object. It will delete itself when the associated X11
+    // window is destroyed.
+    window_x11_ =
+        new CefWindowX11(browser_.get(), parent_window, rect,
+                         CefString(&window_info_.window_name).ToString());
+    DCHECK_NE(window_x11_->xwindow(), x11::Window::None);
+    window_info_.window =
+        static_cast<cef_window_handle_t>(window_x11_->xwindow());
 
-  auto* widget_delegate = new CefNativeWidgetDelegate(
-      GetBackgroundColor(), window_x11_->TopLevelAlwaysOnTop(),
-      GetBoundsChangedCallback(), GetWidgetDeleteCallback());
-  widget_delegate->Init(
-      static_cast<gfx::AcceleratedWidget>(window_info_.window), web_contents_,
-      gfx::Rect(gfx::Point(), rect.size()));
+    host_window_created_ = true;
 
-  window_widget_ = widget_delegate->GetWidget();
-  window_widget_->Show();
+    // Add a reference that will be released in BrowserDestroyed().
+    browser_->AddRef();
 
-  window_x11_->Show();
+    auto* widget_delegate = new CefNativeWidgetDelegate(
+        GetBackgroundColor(), window_x11_->TopLevelAlwaysOnTop(),
+        GetBoundsChangedCallback(), GetWidgetDeleteCallback());
+    widget_delegate->Init(
+        static_cast<gfx::AcceleratedWidget>(window_info_.window),
+        /*parent_wayland_surface=*/nullptr, web_contents_,
+        gfx::Rect(gfx::Point(), rect.size()));
+
+    window_widget_ = widget_delegate->GetWidget();
+    window_widget_->Show();
+
+    window_x11_->Show();
+  }
 #endif  // BUILDFLAG(SUPPORTS_OZONE_X11)
 
   // As an additional requirement on Linux, we must set the colors for the
@@ -118,8 +176,44 @@ void CefBrowserPlatformDelegateNativeLinux::CloseHostWindow() {
 #if BUILDFLAG(SUPPORTS_OZONE_X11)
   if (window_x11_) {
     window_x11_->Close();
+    return;
   }
 #endif
+#if BUILDFLAG(SUPPORTS_OZONE_WAYLAND)
+  // Wayland embedding: no intermediate window; close the hosting widget.
+  if (window_widget_) {
+    if (wayland_close_pending_) {
+      return;
+    }
+    wayland_close_pending_ = true;
+
+    window_widget_->Close();
+  }
+#endif
+}
+
+void CefBrowserPlatformDelegateNativeLinux::WaylandWidgetDeleted() {
+  DCHECK(window_widget_);
+  window_widget_ = nullptr;
+
+  if (!browser_ || wayland_window_destroyed_pending_) {
+    return;
+  }
+  wayland_window_destroyed_pending_ = true;
+
+  // AlloyBrowserHostImpl expects destruction of the native host window to
+  // complete browser teardown via WindowDestroyed(). The embedded Wayland
+  // Widget can disappear either during a requested close or after an Ozone
+  // surface-creation failure. Complete both paths here, after the Widget's
+  // destruction stack has unwound, and exactly once. See CEF issue #2804.
+  CefRefPtr<CefBrowserHostBase> browser(browser_);
+  CEF_POST_TASK(
+      CEF_UIT,
+      base::BindOnce(
+          [](CefRefPtr<CefBrowserHostBase> browser) {
+            AlloyBrowserHostImpl::FromBaseChecked(browser)->WindowDestroyed();
+          },
+          browser));
 }
 
 CefWindowHandle CefBrowserPlatformDelegateNativeLinux::GetHostWindowHandle()
@@ -186,13 +280,68 @@ void CefBrowserPlatformDelegateNativeLinux::NotifyMoveOrResizeStarted() {
 #endif  // BUILDFLAG(SUPPORTS_OZONE_X11)
 }
 
+void CefBrowserPlatformDelegateNativeLinux::SetBounds(const gfx::Rect& bounds) {
+#if BUILDFLAG(SUPPORTS_OZONE_X11)
+  if (window_x11_) {
+    if (window_info_.parent_window == kNullWindowHandle) {
+      LOG(WARNING) << "CefBrowserHost::SetBounds requires an externally "
+                      "parented X11 child window";
+      return;
+    }
+    window_x11_->SetBounds(bounds);
+    window_info_.bounds =
+        CefRect(bounds.x(), bounds.y(), bounds.width(), bounds.height());
+    return;
+  }
+#endif  // BUILDFLAG(SUPPORTS_OZONE_X11)
+
+#if BUILDFLAG(SUPPORTS_OZONE_WAYLAND)
+  if (window_widget_) {
+#if CEF_API_ADDED(CEF_EXPERIMENTAL)
+    if (!window_info_.parent_wayland_surface) {
+      LOG(WARNING) << "CefBrowserHost::SetBounds requires an externally "
+                      "parented Wayland child surface";
+      return;
+    }
+#endif
+
+    const gfx::Point initial_origin(window_info_.bounds.x,
+                                    window_info_.bounds.y);
+    if (bounds.origin() != initial_origin) {
+      LOG(WARNING) << "CefBrowserHost::SetBounds does not yet support Wayland "
+                      "position changes; preserving initial origin "
+                   << initial_origin.ToString();
+    }
+
+    // Keep the Aura/widget origin at zero. A non-zero origin marks this
+    // top-level Widget as off-root and can stop compositor frame production.
+    // Placement is stored independently by WaylandEmbeddedWindow as the
+    // wl_subsurface offset.
+    if (window_info_.bounds.width != bounds.width() ||
+        window_info_.bounds.height != bounds.height()) {
+      NotifyMoveOrResizeStarted();
+    }
+    window_widget_->SetSize(bounds.size());
+    window_info_.bounds.width = bounds.width();
+    window_info_.bounds.height = bounds.height();
+  }
+#endif  // BUILDFLAG(SUPPORTS_OZONE_WAYLAND)
+}
+
 void CefBrowserPlatformDelegateNativeLinux::SizeTo(int width, int height) {
 #if BUILDFLAG(SUPPORTS_OZONE_X11)
   if (window_x11_) {
-    window_x11_->SetBounds(
-        gfx::Rect(window_x11_->bounds().origin(), gfx::Size(width, height)));
+    window_x11_->SetSize(gfx::Size(width, height));
+    return;
   }
 #endif  // BUILDFLAG(SUPPORTS_OZONE_X11)
+#if BUILDFLAG(SUPPORTS_OZONE_WAYLAND)
+  // Wayland embedding: resize the hosting widget while preserving its
+  // zero-origin Aura bounds and independent wl_subsurface offset.
+  if (window_widget_) {
+    window_widget_->SetSize(gfx::Size(width, height));
+  }
+#endif  // BUILDFLAG(SUPPORTS_OZONE_WAYLAND)
 }
 
 void CefBrowserPlatformDelegateNativeLinux::ViewText(const std::string& text) {

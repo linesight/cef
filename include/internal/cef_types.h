@@ -509,6 +509,29 @@ typedef struct _cef_settings_t {
   ///
   int use_views_default_popup;
 #endif
+
+#if CEF_API_ADDED(CEF_EXPERIMENTAL) && defined(OS_LINUX)
+  ///
+  /// Wayland display connection (wl_display*) to share with Chromium's
+  /// Ozone/Wayland backend. When set, CEF uses this existing connection
+  /// instead of calling wl_display_connect() internally. This is required for
+  /// Wayland window embedding (see cef_window_info_t::parent_wayland_surface),
+  /// because subsurface parenting requires the host application and CEF to use
+  /// the same wl_display. Every parent surface passed to CEF must have been
+  /// created from this exact connection.
+  ///
+  /// CEF does not own or disconnect this connection. The client must keep it
+  /// valid until CefShutdown() returns. The client also retains ownership of
+  /// its Wayland event queue(s). Because the client and CEF share one display
+  /// file descriptor, display reads and round trips must not be performed
+  /// concurrently from another thread. Shared-display dispatch and round-trip
+  /// behavior are experimental.
+  ///
+  /// Only used on Linux with the Ozone/Wayland backend; ignored on the X11
+  /// backend and other platforms.
+  ///
+  cef_wayland_display_handle_t wayland_display;
+#endif
 } cef_settings_t;
 
 ///

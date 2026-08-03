@@ -6,6 +6,7 @@
 #define CEF_LIBCEF_BROWSER_NATIVE_BROWSER_PLATFORM_DELEGATE_NATIVE_LINUX_H_
 
 #include "base/memory/raw_ptr.h"
+#include "base/memory/weak_ptr.h"
 #include "cef/libcef/browser/native/browser_platform_delegate_native_aura.h"
 #include "ui/base/ozone_buildflags.h"
 
@@ -28,6 +29,7 @@ class CefBrowserPlatformDelegateNativeLinux
   views::Widget* GetWindowWidget() const override;
   void SetFocus(bool setFocus) override;
   void NotifyMoveOrResizeStarted() override;
+  void SetBounds(const gfx::Rect& bounds) override;
   void SizeTo(int width, int height) override;
   void ViewText(const std::string& text) override;
   bool HandleKeyboardEvent(const input::NativeWebKeyboardEvent& event) override;
@@ -40,12 +42,26 @@ class CefBrowserPlatformDelegateNativeLinux
       const CefKeyEvent& key_event) const override;
 
  private:
+  // Clears |window_widget_| and schedules the one-shot CEF close completion
+  // after a requested close or an unexpected Ozone window failure.
+  void WaylandWidgetDeleted();
+
   // True if the host window has been created.
   bool host_window_created_ = false;
+
+  // Prevent repeated Close() requests while the embedded Wayland Widget is
+  // closing.
+  bool wayland_close_pending_ = false;
+
+  // True once Widget destruction has scheduled WindowDestroyed().
+  bool wayland_window_destroyed_pending_ = false;
 
 #if BUILDFLAG(SUPPORTS_OZONE_X11)
   raw_ptr<CefWindowX11> window_x11_ = nullptr;
 #endif
+
+  base::WeakPtrFactory<CefBrowserPlatformDelegateNativeLinux> weak_ptr_factory_{
+      this};
 };
 
 #endif  // CEF_LIBCEF_BROWSER_NATIVE_BROWSER_PLATFORM_DELEGATE_NATIVE_LINUX_H_

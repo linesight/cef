@@ -182,6 +182,11 @@ class RootWindowGtk : public RootWindow, public BrowserWindow::Delegate {
   bool window_destroyed_;
   bool browser_destroyed_;
 
+  // Wayland only: keep the external GTK parent surface alive while browser
+  // creation or destruction is pending. A close requested before
+  // OnBrowserCreated() is replayed as soon as the browser becomes available.
+  bool wayland_close_pending_ = false;
+
   // Members only accessed on the UI thread because they're needed for
   // WindowDelete.
   bool force_close_;

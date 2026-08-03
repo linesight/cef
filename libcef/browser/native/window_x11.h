@@ -44,6 +44,7 @@ class CefWindowX11 : public ui::PlatformEventDispatcher,
   void Focus();
 
   void SetBounds(const gfx::Rect& bounds);
+  void SetSize(const gfx::Size& size);
 
   gfx::Rect GetBoundsInScreen();
 

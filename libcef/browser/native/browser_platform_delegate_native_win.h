@@ -27,6 +27,7 @@ class CefBrowserPlatformDelegateNativeWin
   views::Widget* GetWindowWidget() const override;
   void SetFocus(bool setFocus) override;
   void NotifyMoveOrResizeStarted() override;
+  void SetBounds(const gfx::Rect& bounds) override;
   void SizeTo(int width, int height) override;
   void ViewText(const std::string& text) override;
   bool HandleKeyboardEvent(const input::NativeWebKeyboardEvent& event) override;

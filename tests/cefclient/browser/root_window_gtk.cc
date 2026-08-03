@@ -39,6 +39,15 @@ void UseDefaultX11VisualForGtk(GtkWidget* widget) {
   // Let's use the default X11 visual instead of the GTK's blessed one.
   // Copied from: https://github.com/cztomczak/cefcapi.
   GdkScreen* screen = gdk_screen_get_default();
+
+  // There is no X11 visual to select on non-X11 (e.g. Wayland) backends. Note
+  // GDK_X11_SCREEN() is a checked cast that only logs a warning (and returns a
+  // non-null pointer) on a Wayland screen, so guard with the type check to
+  // avoid dereferencing X11-specific fields below (CEF issue #2804).
+  if (!GDK_IS_X11_SCREEN(screen)) {
+    return;
+  }
+
   GList* visuals = gdk_screen_list_visuals(screen);
 
   GdkX11Screen* x11_screen = GDK_X11_SCREEN(screen);
@@ -450,11 +459,27 @@ void RootWindowGtk::Close(bool force) {
   REQUIRE_MAIN_THREAD();
 
   if (window_) {
-    ScopedGdkThreadsEnter scoped_gdk_threads;
-
     if (force) {
       NotifyForceClose();
     }
+
+    // A Wayland subsurface does not inherit destruction from its external GTK
+    // parent. Keep that parent surface alive until CEF has closed the browser;
+    // OnBrowserWindowDestroyed() will return here with no BrowserWindow and
+    // destroy the GTK window. Browser creation is asynchronous, so defer even
+    // when GetBrowser() is not available yet and replay the close from
+    // OnBrowserCreated(). This also keeps force-close/signal handling ordered.
+    if (MainContext::Get()->GetCommandLine()->HasSwitch(
+            switches::kWaylandEmbed) &&
+        browser_window_) {
+      wayland_close_pending_ = true;
+      if (CefRefPtr<CefBrowser> browser = GetBrowser()) {
+        browser->GetHost()->CloseBrowser(force);
+      }
+      return;
+    }
+
+    ScopedGdkThreadsEnter scoped_gdk_threads;
     gtk_widget_destroy(window_);
   }
 }
@@ -641,15 +666,20 @@ void RootWindowGtk::CreateRootWindow(const CefBrowserSettings& settings,
   // added to the grid container for automatic layout-based sizing.
   GtkWidget* parent = with_osr_ ? grid : window_;
 
-  // Set the Display associated with the browser.
-  ::Display* xdisplay = GDK_WINDOW_XDISPLAY(gtk_widget_get_window(window_));
-  CHECK(xdisplay);
-  if (with_osr_) {
-    static_cast<BrowserWindowOsrGtk*>(browser_window_.get())
-        ->set_xdisplay(xdisplay);
-  } else {
-    static_cast<BrowserWindowStdGtk*>(browser_window_.get())
-        ->set_xdisplay(xdisplay);
+  // Set the Display associated with the browser. X11 only: on Wayland the
+  // browser is embedded as a wl_subsurface and requires no X11 window
+  // manipulation, and GDK_WINDOW_XDISPLAY would return an invalid pointer
+  // (CEF issue #2804).
+  if (GDK_IS_X11_DISPLAY(gtk_widget_get_display(window_))) {
+    ::Display* xdisplay = GDK_WINDOW_XDISPLAY(gtk_widget_get_window(window_));
+    CHECK(xdisplay);
+    if (with_osr_) {
+      static_cast<BrowserWindowOsrGtk*>(browser_window_.get())
+          ->set_xdisplay(xdisplay);
+    } else {
+      static_cast<BrowserWindowStdGtk*>(browser_window_.get())
+          ->set_xdisplay(xdisplay);
+    }
   }
 
   if (with_osr_) {
@@ -682,6 +712,15 @@ void RootWindowGtk::CreateRootWindow(const CefBrowserSettings& settings,
 
 void RootWindowGtk::OnBrowserCreated(CefRefPtr<CefBrowser> browser) {
   REQUIRE_MAIN_THREAD();
+
+  if (wayland_close_pending_) {
+    // Close() may have arrived after CreateBrowser() was accepted but before
+    // this asynchronous callback. The external GTK parent was intentionally
+    // retained; now close the late browser before allowing that parent to be
+    // destroyed in OnBrowserWindowDestroyed().
+    browser->GetHost()->CloseBrowser(force_close_);
+    return;
+  }
 
   // For popup browsers create the root window once the browser has been
   // created.
@@ -1030,6 +1069,21 @@ gboolean RootWindowGtk::WindowDelete(GtkWidget* widget,
 
   SaveWindowRestore(widget, self->GetDeviceScaleFactor());
 
+  // The GTK window owns the external parent surface of the embedded Wayland
+  // browser. Never let a delete event (including a repeated event while forced
+  // or asynchronous browser shutdown is pending) destroy that parent first.
+  // OnBrowserWindowDestroyed() performs the final programmatic GTK close. This
+  // also covers a delete event received while CreateBrowser() is still pending.
+  if (MainContext::Get()->GetCommandLine()->HasSwitch(
+          switches::kWaylandEmbed) &&
+      self->browser_window_) {
+    self->wayland_close_pending_ = true;
+    if (!self->force_close_ && !self->is_closing_ && self->GetBrowser()) {
+      self->NotifyCloseBrowser();
+    }
+    return TRUE;
+  }
+
   // Called to query whether the root window should be closed.
   if (self->force_close_) {
     return FALSE;  // Allow the close.
@@ -1127,9 +1181,13 @@ gboolean RootWindowGtk::URLEntryButtonPress(GtkWidget* widget,
 
   // Give focus to the GTK window. This is a work-around for bad focus-related
   // interaction between the root window managed by GTK and the browser managed
-  // by X11.
+  // by X11. It is not applicable to the Wayland embedding path.
   GtkWidget* window = gtk_widget_get_ancestor(widget, GTK_TYPE_WINDOW);
   GdkWindow* gdk_window = gtk_widget_get_window(window);
+  if (!gdk_window || !GDK_IS_X11_WINDOW(gdk_window)) {
+    return FALSE;
+  }
+
   ::Display* xdisplay = GDK_WINDOW_XDISPLAY(gdk_window);
   ::Window xwindow = GDK_WINDOW_XID(gdk_window);
 

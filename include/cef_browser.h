@@ -1088,6 +1088,25 @@ class CefBrowserHost : public virtual CefBaseRefCounted {
   ///
   /*--cef(added=experimental)--*/
   virtual void SetAxViewportCollapse(bool enabled) = 0;
+
+  ///
+  /// Set the bounds of the browser's native child window. On Windows and X11,
+  /// |bounds| are device pixels relative to the parent client area. On Wayland,
+  /// |bounds| are logical pixels (DIP) relative to the parent surface.
+  /// Width/height must be greater than zero. This method is only supported for
+  /// windowed Alloy-style browsers with an external parent on Windows and
+  /// Linux. It is a no-op for windowless or Views-hosted browsers.
+  ///
+  /// On Wayland, only size changes are currently supported. The x/y values
+  /// must match the initial bounds passed to SetAsWaylandChild(). Runtime
+  /// repositioning requires the embedder to commit the parent surface and is
+  /// not yet supported by this method.
+  ///
+  /// If called on the UI thread the bounds will be applied immediately.
+  /// Otherwise, the bounds will be applied asynchronously on the UI thread.
+  ///
+  /*--cef(added=experimental)--*/
+  virtual void SetBounds(const CefRect& bounds) = 0;
 #endif
 };
 

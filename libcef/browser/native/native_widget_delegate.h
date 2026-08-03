@@ -16,8 +16,10 @@ class WebContents;
 }
 
 namespace views {
+class FrameView;
 class WebView;
-}
+class Widget;
+}  // namespace views
 
 class CefNativeContentsView;
 
@@ -33,8 +35,14 @@ class CefNativeWidgetDelegate : public views::WidgetDelegate {
   CefNativeWidgetDelegate(const CefNativeWidgetDelegate&) = delete;
   CefNativeWidgetDelegate& operator=(const CefNativeWidgetDelegate&) = delete;
 
-  // Create the Widget and associated root window.
+  // Create the Widget and associated root window. Exactly one parent is used:
+  // |parent_widget| for the X11 backend (the browser is hosted as a child of
+  // that native window), or |parent_wayland_surface| (a wl_surface*) for the
+  // Ozone/Wayland backend (the browser is embedded as a top-level widget whose
+  // WaylandWindow roots itself as a wl_subsurface of that external surface).
+  // See CEF issue #2804.
   void Init(gfx::AcceleratedWidget parent_widget,
+            void* parent_wayland_surface,
             content::WebContents* web_contents,
             const gfx::Rect& bounds);
 
@@ -43,11 +51,23 @@ class CefNativeWidgetDelegate : public views::WidgetDelegate {
 
   // WidgetDelegate methods:
   bool CanMaximize() const override { return true; }
+  bool MaybeGetMinimumSize(gfx::Size* size) const override;
   views::View* GetContentsView() override { return contents_view_.get(); }
   void WidgetIsZombie(views::Widget* widget) override;
+  // On the Ozone/Wayland embedding path the widget is a TYPE_WINDOW toplevel,
+  // for which Views would otherwise draw a client-side window frame (title bar
+  // + caption buttons) inside our wl_subsurface -- making the browser look like
+  // a nested window and insetting the web contents. The subsurface has no OS
+  // decorations, so use a frameless NativeFrameView: the contents fill the
+  // whole surface. See CEF issue #2804.
+  std::unique_ptr<views::FrameView> CreateFrameView(
+      views::Widget* widget) override;
 
   const SkColor background_color_;
   const bool always_on_top_;
+  // True on the Ozone/Wayland embedding path; suppresses the Views window
+  // frame.
+  bool frameless_ = false;
   base::RepeatingClosure on_bounds_changed_;
   base::OnceClosure on_delete_;
 
