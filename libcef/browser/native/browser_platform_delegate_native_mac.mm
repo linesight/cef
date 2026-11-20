@@ -34,26 +34,171 @@
 #include "ui/gfx/geometry/rect.h"
 
 // Wrapper NSView for the native view. Necessary to destroy the browser when
-// the view is deleted.
+// the view is deleted or, for browsers parented to a client-provided view,
+// when the containing window closes.
 @interface CefBrowserHostView : NSView {
  @private
   CefBrowserHostBase* browser_;  // weak
+  BOOL destroyOnWindowClose_;
+  NSWindow* __weak observedWindow_;
+  // Set when CEF asks to close the host window (after DoClose() returns
+  // false). |hostWindow_| is the window that contained this view at that time.
+  BOOL closeRequested_;
+  NSWindow* __weak hostWindow_;
+  // Set when browser destruction has been scheduled.
+  BOOL destroyScheduled_;
+  // Keeps a closing window, and therefore the client-provided parent view,
+  // alive until the scheduled destruction runs.
+  NSWindow* __strong closingWindow_;
 }
 
 @property(nonatomic, assign) CefBrowserHostBase* browser;
+
+// When YES the browser is destroyed when the window containing this view
+// closes instead of waiting for this view to deallocate, which may never
+// happen while the client references the window. Used for browsers parented
+// to a client-provided view, which have no CefWindowDelegate. This matches
+// Chromium, which treats NSWindowWillCloseNotification as window destruction
+// (see ui/native_window_tracker/native_window_tracker_cocoa.mm).
+@property(nonatomic, assign) BOOL destroyOnWindowClose;
+
+// Called when the browser is destroyed by some other means (for example,
+// during CefShutdown) so that this view no longer references it.
+- (void)browserDestroyed;
+
+// Called when CEF needs to close the host window after DoClose() returned
+// false. Only used when |destroyOnWindowClose| is YES. Closes the window that
+// contains this view, or destroys the browser if there is none. If this view
+// later leaves that window the browser is destroyed instead, so CEF never
+// closes a window that it was not asked to close.
+- (void)closeHostWindow;
 
 @end
 
 @implementation CefBrowserHostView
 
 @synthesize browser = browser_;
+@synthesize destroyOnWindowClose = destroyOnWindowClose_;
 
 - (void)dealloc {
+  [[NSNotificationCenter defaultCenter] removeObserver:self];
   if (browser_) {
     // Force the browser to be destroyed and release the reference added in
     // PlatformCreateWindow().
     AlloyBrowserHostImpl::FromBaseChecked(browser_)->WindowDestroyed();
   }
+}
+
+- (void)browserDestroyed {
+  browser_ = nullptr;
+  destroyOnWindowClose_ = NO;
+  closingWindow_ = nil;
+  [self observeWindow:nil];
+}
+
+- (void)setDestroyOnWindowClose:(BOOL)destroyOnWindowClose {
+  destroyOnWindowClose_ = destroyOnWindowClose;
+  [self observeWindow:destroyOnWindowClose_ ? [self window] : nil];
+}
+
+- (void)viewWillMoveToWindow:(NSWindow*)newWindow {
+  [super viewWillMoveToWindow:newWindow];
+  if (destroyOnWindowClose_) {
+    [self observeWindow:newWindow];
+  }
+}
+
+- (void)viewDidMoveToWindow {
+  [super viewDidMoveToWindow];
+  if (destroyOnWindowClose_ && closeRequested_ &&
+      [self window] != hostWindow_) {
+    // The view left the host window after CEF asked to close it (for example,
+    // the client removed it or moved it to another window).
+    [self scheduleDestroy];
+  }
+}
+
+- (void)closeHostWindow {
+  if (!browser_ || closeRequested_) {
+    return;
+  }
+  closeRequested_ = YES;
+  hostWindow_ = [self window];
+  // Continue after clearing the stack.
+  [self performSelectorOnMainThread:@selector(continueClose)
+                         withObject:nil
+                      waitUntilDone:NO];
+}
+
+- (void)continueClose {
+  if (!browser_ || destroyScheduled_) {
+    return;
+  }
+  if (hostWindow_ && [self window] == hostWindow_) {
+    // Destruction completes when the window closes (see windowWillClose:).
+    [hostWindow_ performClose:nil];
+    return;
+  }
+  // There is no host window to close, so destroy the browser directly
+  // instead of waiting for a window close or view deallocation that may never
+  // happen.
+  [self destroyBrowser];
+}
+
+- (void)scheduleDestroy {
+  if (!browser_ || destroyScheduled_) {
+    return;
+  }
+  destroyScheduled_ = YES;
+  // Destroy the browser after clearing the stack of anything that might have
+  // the window on it. Matches the behavior of CefWindowDelegate.
+  [self performSelectorOnMainThread:@selector(destroyBrowser)
+                         withObject:nil
+                      waitUntilDone:NO];
+}
+
+- (void)observeWindow:(NSWindow*)window {
+  NSNotificationCenter* center = [NSNotificationCenter defaultCenter];
+  NSWindow* oldWindow = observedWindow_;
+  if (oldWindow == window) {
+    return;
+  }
+  if (oldWindow) {
+    [center removeObserver:self
+                      name:NSWindowWillCloseNotification
+                    object:oldWindow];
+  }
+  observedWindow_ = window;
+  if (window) {
+    [center addObserver:self
+               selector:@selector(windowWillClose:)
+                   name:NSWindowWillCloseNotification
+                 object:window];
+  }
+}
+
+- (void)windowWillClose:(NSNotification*)notification {
+  // The window that contains this view is closing.
+  if (browser_ && !closingWindow_) {
+    closingWindow_ = notification.object;
+  }
+  [self scheduleDestroy];
+}
+
+- (void)destroyBrowser {
+  // The browser may already have been destroyed by other means (for example,
+  // during CefShutdown) before scheduled destruction runs.
+  if (!browser_) {
+    closingWindow_ = nil;
+    return;
+  }
+  [self observeWindow:nil];
+  CefRefPtr<AlloyBrowserHostImpl> browser =
+      AlloyBrowserHostImpl::FromBaseChecked(browser_);
+  // Prevent dealloc from notifying the destroyed browser again later.
+  browser_ = nullptr;
+  browser->WindowDestroyed();
+  closingWindow_ = nil;
 }
 
 @end
@@ -235,16 +380,30 @@ void GetNSBoundsInDisplay(const gfx::Rect& dip_bounds,
 
 }  // namespace
 
+struct CefBrowserPlatformDelegateNativeMac::ObjCStorage {
+  // Weak so that it reads as nil while the view is deallocating.
+  CefBrowserHostView* __weak host_view = nil;
+};
+
 CefBrowserPlatformDelegateNativeMac::CefBrowserPlatformDelegateNativeMac(
     const CefWindowInfo& window_info,
     SkColor background_color)
-    : CefBrowserPlatformDelegateNative(window_info, background_color) {}
+    : CefBrowserPlatformDelegateNative(window_info, background_color),
+      objc_storage_(std::make_unique<ObjCStorage>()) {}
+
+CefBrowserPlatformDelegateNativeMac::~CefBrowserPlatformDelegateNativeMac() =
+    default;
 
 void CefBrowserPlatformDelegateNativeMac::BrowserDestroyed(
     CefBrowserHostBase* browser) {
   CefBrowserPlatformDelegateNative::BrowserDestroyed(browser);
 
   if (host_window_created_) {
+    // Clear the view's reference before releasing the browser. |host_view| is
+    // nil if this is called while the view is deallocating.
+    [objc_storage_->host_view browserDestroyed];
+    objc_storage_->host_view = nil;
+
     // Release the references added in CreateHostWindow().
     browser->Release();
     [window_delegate_ browserDestroyed];
@@ -314,6 +473,11 @@ bool CefBrowserPlatformDelegateNativeMac::CreateHostWindow() {
   CefBrowserHostView* browser_view =
       [[CefBrowserHostView alloc] initWithFrame:browser_view_rect];
   browser_view.browser = browser_;
+  if (!new_window) {
+    // The client owns the window. Destroy the browser when that window closes
+    // because there is no CefWindowDelegate to do so (see issue #3810).
+    browser_view.destroyOnWindowClose = YES;
+  }
   [parent_view addSubview:browser_view];
   [browser_view setAutoresizingMask:(NSViewWidthSizable | NSViewHeightSizable)];
   [browser_view setNeedsDisplay:YES];
@@ -327,6 +491,7 @@ bool CefBrowserPlatformDelegateNativeMac::CreateHostWindow() {
   [native_view setNeedsDisplay:YES];
 
   window_info_.view = CAST_NSVIEW_TO_CEF_WINDOW_HANDLE(browser_view);
+  objc_storage_->host_view = browser_view;
 
   if (new_window != nil && !window_info_.hidden) {
     // Show the window.
@@ -338,11 +503,20 @@ bool CefBrowserPlatformDelegateNativeMac::CreateHostWindow() {
 
 void CefBrowserPlatformDelegateNativeMac::CloseHostWindow() {
   NSView* nsview = CAST_CEF_WINDOW_HANDLE_TO_NSVIEW(window_info_.view);
-  if (nsview != nil) {
-    [[nsview window] performSelectorOnMainThread:@selector(performClose:)
-                                      withObject:nil
-                                   waitUntilDone:NO];
+  if (nsview == nil) {
+    return;
   }
+  CefBrowserHostView* host_view = objc_storage_->host_view;
+  if (host_view.destroyOnWindowClose) {
+    // The client owns the window. The view may have been removed from it, or
+    // moved to another window, so let the view decide how to complete the
+    // close.
+    [host_view closeHostWindow];
+    return;
+  }
+  [[nsview window] performSelectorOnMainThread:@selector(performClose:)
+                                    withObject:nil
+                                 waitUntilDone:NO];
 }
 
 CefWindowHandle CefBrowserPlatformDelegateNativeMac::GetHostWindowHandle()

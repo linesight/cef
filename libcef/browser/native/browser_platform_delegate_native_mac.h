@@ -5,6 +5,8 @@
 #ifndef CEF_LIBCEF_BROWSER_NATIVE_BROWSER_PLATFORM_DELEGATE_NATIVE_MAC_H_
 #define CEF_LIBCEF_BROWSER_NATIVE_BROWSER_PLATFORM_DELEGATE_NATIVE_MAC_H_
 
+#include <memory>
+
 #include "cef/libcef/browser/native/browser_platform_delegate_native.h"
 
 #if defined(__OBJC__)
@@ -23,6 +25,7 @@ class CefBrowserPlatformDelegateNativeMac
  public:
   CefBrowserPlatformDelegateNativeMac(const CefWindowInfo& window_info,
                                       SkColor background_color);
+  ~CefBrowserPlatformDelegateNativeMac() override;
 
   // CefBrowserPlatformDelegate methods:
   void BrowserDestroyed(CefBrowserHostBase* browser) override;
@@ -86,6 +89,10 @@ class CefBrowserPlatformDelegateNativeMac
   bool host_window_created_ = false;
 
   CefWindowDelegate* __strong window_delegate_;
+
+  // Holds a weak reference to the CefBrowserHostView.
+  struct ObjCStorage;
+  std::unique_ptr<ObjCStorage> objc_storage_;
 };
 
 #endif  // CEF_LIBCEF_BROWSER_NATIVE_BROWSER_PLATFORM_DELEGATE_NATIVE_MAC_H_
